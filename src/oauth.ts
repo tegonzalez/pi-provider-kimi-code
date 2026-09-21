@@ -2,9 +2,9 @@
 // reuse, the login / refresh handlers wired into pi's OAuth interface, and
 // the stream-level auth refresh used by the streaming handler.
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { lock as acquireFileLock } from "proper-lockfile";
 
@@ -96,11 +96,11 @@ async function acquireKimiCodeRefreshLock(signal?: AbortSignal): Promise<() => P
   if (process.platform === "win32" || process.env.KIMI_DISABLE_OAUTH_LOCK === "1") {
     return async () => {};
   }
-  const target = join(
-    process.env.KIMI_CODE_HOME || join(os.homedir(), ".kimi-code"),
-    "oauth",
-    "kimi-code",
-  );
+  // Derive the lock target from the discovered credential filename so we share
+  // the CLI's lock for env-specific credential files
+  // (`oauth/kimi-code-env-<hash>`), not just the legacy `oauth/kimi-code`.
+  const lockName = basename(discoverKimiCodeCredentialPath(), ".json");
+  const target = join(getKimiCodeHome(), "oauth", lockName);
   mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
   writeFileSync(target, "", { encoding: "utf-8", flag: "a" });
   return acquireSharedFileLock(target, signal, {
@@ -386,14 +386,41 @@ interface KimiCliCredentialsFile {
   expires_in?: number;
 }
 
+function getKimiCodeHome(): string {
+  return process.env.KIMI_CODE_HOME || join(os.homedir(), ".kimi-code");
+}
+
+// Newer Kimi Code CLI builds key credential files per environment:
+// `credentials/kimi-code-env-<hash>.json` with a matching `oauth/kimi-code-env-<hash>`
+// lock target. Older builds use the fixed `credentials/kimi-code.json`. Discover the
+// active file (newest env-specific file wins) so reuse, write-back, and locking all
+// target the file the CLI actually reads.
+function discoverKimiCodeCredentialPath(): string {
+  const credentialsDir = join(getKimiCodeHome(), "credentials");
+  try {
+    const envFiles = readdirSync(credentialsDir)
+      .filter((name) => /^kimi-code-env-.+\.json$/.test(name))
+      .map((name) => ({ name, mtimeMs: statSync(join(credentialsDir, name)).mtimeMs }))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    if (envFiles.length > 0) {
+      return join(credentialsDir, envFiles[0].name);
+    }
+  } catch {
+    // credentials dir missing or unreadable — fall through to the fixed name.
+  }
+  return join(credentialsDir, "kimi-code.json");
+}
+
 function getKimiCodeCredentialPath(): string {
-  const kimiCodeHome = process.env.KIMI_CODE_HOME || join(os.homedir(), ".kimi-code");
-  return join(kimiCodeHome, "credentials", "kimi-code.json");
+  return discoverKimiCodeCredentialPath();
 }
 
 function getKimiCredentialPaths(): string[] {
   const shareDir = process.env.KIMI_SHARE_DIR || join(os.homedir(), ".kimi");
-  return [getKimiCodeCredentialPath(), join(shareDir, "credentials", "kimi-code.json")];
+  const discovered = discoverKimiCodeCredentialPath();
+  const fixed = join(getKimiCodeHome(), "credentials", "kimi-code.json");
+  const paths = [discovered, fixed, join(shareDir, "credentials", "kimi-code.json")];
+  return [...new Set(paths)];
 }
 
 function readKimiCliCredentials(): KimiCliCredentialsFile | null {
