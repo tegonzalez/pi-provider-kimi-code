@@ -2,7 +2,22 @@
 // reuse, the login / refresh handlers wired into pi's OAuth interface, and
 // the stream-level auth refresh used by the streaming handler.
 
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import os from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -92,14 +107,17 @@ async function acquireAuthFileLock(
   });
 }
 
-async function acquireKimiCodeRefreshLock(signal?: AbortSignal): Promise<() => Promise<void>> {
+async function acquireKimiCodeRefreshLock(
+  credentialPath: string,
+  signal?: AbortSignal,
+): Promise<() => Promise<void>> {
   if (process.platform === "win32" || process.env.KIMI_DISABLE_OAUTH_LOCK === "1") {
     return async () => {};
   }
   // Derive the lock target from the discovered credential filename so we share
   // the CLI's lock for env-specific credential files
   // (`oauth/kimi-code-env-<hash>`), not just the legacy `oauth/kimi-code`.
-  const lockName = basename(discoverKimiCodeCredentialPath(), ".json");
+  const lockName = basename(credentialPath, ".json");
   const target = join(getKimiCodeHome(), "oauth", lockName);
   mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
   writeFileSync(target, "", { encoding: "utf-8", flag: "a" });
@@ -157,6 +175,8 @@ async function lockStoredOAuthCredential(
 
 import {
   CLIENT_ID,
+  KIMI_REGION_PROFILES,
+  type KimiRegion,
   PROVIDER_ID,
   RETRYABLE_REFRESH_STATUSES,
   getBaseUrl,
@@ -390,41 +410,76 @@ function getKimiCodeHome(): string {
   return process.env.KIMI_CODE_HOME || join(os.homedir(), ".kimi-code");
 }
 
-// Newer Kimi Code CLI builds key credential files per environment:
-// `credentials/kimi-code-env-<hash>.json` with a matching `oauth/kimi-code-env-<hash>`
-// lock target. Older builds use the fixed `credentials/kimi-code.json`. Discover the
-// active file (newest env-specific file wins) so reuse, write-back, and locking all
-// target the file the CLI actually reads.
-function discoverKimiCodeCredentialPath(): string {
+// Mirrors kimi-code's resolveKimiCodeOAuthKey (packages/oauth/src/managed-kimi-code.ts):
+// the default mainland endpoints share the `kimi-code` slot; any other
+// (oauthHost, baseUrl) pair gets `kimi-code-env-<sha256(json)[:16]>`. Deriving
+// it from the endpoints pi is about to call keeps token and endpoint matched.
+// Exported for tests.
+export function resolveKimiCodeCredentialName(
+  oauthHost: string = getOAuthHost(),
+  baseUrl: string = normalizeKimiBaseV1(getBaseUrl()),
+): string {
+  const host = oauthHost.trim().replace(/\/+$/, "");
+  const base = baseUrl.trim().replace(/\/+$/, "");
+  const mainland = KIMI_REGION_PROFILES["mainland-cn"];
+  if (host === mainland.oauthHost && base === `${mainland.apiBase}/coding/v1`) return "kimi-code";
+  const digest = createHash("sha256")
+    .update(JSON.stringify({ oauthHost: host, baseUrl: base }))
+    .digest("hex")
+    .slice(0, 16);
+  return `kimi-code-env-${digest}`;
+}
+
+// The live kimi-code credential file, shared in place with the CLI (never
+// copied). Order: the slot kimi-code derives for pi's endpoints, then the
+// newest `kimi-code-env-*.json`, then the legacy `kimi-code.json`. With none
+// present, the derived slot is where a fresh login lands. Exported for tests.
+export function discoverKimiCodeCredentialPath(): string {
   const credentialsDir = join(getKimiCodeHome(), "credentials");
+  const derived = join(credentialsDir, `${resolveKimiCodeCredentialName()}.json`);
+  if (existsSync(derived)) return derived;
   try {
     const envFiles = readdirSync(credentialsDir)
-      .filter((name) => /^kimi-code-env-.+\.json$/.test(name))
+      .filter((name) => /^kimi-code-env-[^.]+\.json$/.test(name))
       .map((name) => ({ name, mtimeMs: statSync(join(credentialsDir, name)).mtimeMs }))
       .sort((a, b) => b.mtimeMs - a.mtimeMs);
-    if (envFiles.length > 0) {
-      return join(credentialsDir, envFiles[0].name);
-    }
+    if (envFiles.length > 0) return join(credentialsDir, envFiles[0].name);
   } catch {
-    // credentials dir missing or unreadable — fall through to the fixed name.
+    // credentials dir missing or unreadable — fall through.
   }
-  return join(credentialsDir, "kimi-code.json");
+  const legacy = join(credentialsDir, "kimi-code.json");
+  return existsSync(legacy) ? legacy : derived;
 }
 
-function getKimiCodeCredentialPath(): string {
-  return discoverKimiCodeCredentialPath();
+// With no region from pi config or KIMI_CODE_REGION, follow the kimi-code
+// login: the region whose credential slot was written most recently, so the
+// endpoints pi calls match the token it reuses. Exported for index.ts/tests.
+export function inferKimiCodeLoginRegion(): KimiRegion | null {
+  if (process.env.KIMI_CODE_REGION?.trim()) return null;
+  const credentialsDir = join(getKimiCodeHome(), "credentials");
+  let best: { region: KimiRegion; mtimeMs: number } | null = null;
+  for (const region of Object.keys(KIMI_REGION_PROFILES) as KimiRegion[]) {
+    const { apiBase, oauthHost } = KIMI_REGION_PROFILES[region];
+    const name = resolveKimiCodeCredentialName(oauthHost, `${apiBase}/coding/v1`);
+    try {
+      const { mtimeMs } = statSync(join(credentialsDir, `${name}.json`));
+      if (!best || mtimeMs > best.mtimeMs) best = { region, mtimeMs };
+    } catch {
+      // slot absent
+    }
+  }
+  return best?.region ?? null;
 }
 
-function getKimiCredentialPaths(): string[] {
+function getKimiCredentialPaths(credentialPath = discoverKimiCodeCredentialPath()): string[] {
   const shareDir = process.env.KIMI_SHARE_DIR || join(os.homedir(), ".kimi");
-  const discovered = discoverKimiCodeCredentialPath();
-  const fixed = join(getKimiCodeHome(), "credentials", "kimi-code.json");
-  const paths = [discovered, fixed, join(shareDir, "credentials", "kimi-code.json")];
-  return [...new Set(paths)];
+  return [...new Set([credentialPath, join(shareDir, "credentials", "kimi-code.json")])];
 }
 
-function readKimiCliCredentials(): KimiCliCredentialsFile | null {
-  for (const path of getKimiCredentialPaths()) {
+function readKimiCliCredentials(
+  credentialPath = discoverKimiCodeCredentialPath(),
+): KimiCliCredentialsFile | null {
+  for (const path of getKimiCredentialPaths(credentialPath)) {
     try {
       if (!existsSync(path)) continue;
       const data = JSON.parse(readFileSync(path, "utf-8")) as KimiCliCredentialsFile;
@@ -437,8 +492,20 @@ function readKimiCliCredentials(): KimiCliCredentialsFile | null {
   return null;
 }
 
-function writeKimiCodeCredentials(access: string, refresh: string, expiresMs: number): void {
-  const path = getKimiCodeCredentialPath();
+// Runtime reuse (no auth.json seeding): the kimi-code credential translated to
+// the access token pi sends. Exported for the stream, tools, and usage paths.
+export function readKimiCodeAccessToken(): string | null {
+  return readKimiCliCredentials()?.access_token?.trim() || null;
+}
+
+// Same write protocol as kimi-code's FileTokenStorage.save: temp file in the
+// same dir, fsync, chmod 0600, rename — readers never see a partial file.
+function writeKimiCodeCredentials(
+  access: string,
+  refresh: string,
+  expiresMs: number,
+  path: string = discoverKimiCodeCredentialPath(),
+): void {
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const data: KimiCliCredentialsFile = {
@@ -449,8 +516,27 @@ function writeKimiCodeCredentials(access: string, refresh: string, expiresMs: nu
     token_type: "Bearer",
     expires_in: Math.max(0, Math.floor((expiresMs - Date.now()) / 1000)),
   };
-  writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
-  chmodSync(path, 0o600);
+  const tmp = `${path}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
+  const bytes = Buffer.from(`${JSON.stringify(data, null, 2)}\n`, "utf-8");
+  const fd = openSync(tmp, "w", 0o600);
+  try {
+    let written = 0;
+    while (written < bytes.length) written += writeSync(fd, bytes, written);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, path);
+  } catch (error) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // ignore
+    }
+    throw error;
+  }
 }
 
 interface LockedKimiCodeCredentials {
@@ -460,11 +546,15 @@ interface LockedKimiCodeCredentials {
 }
 
 async function lockKimiCodeCredentials(signal?: AbortSignal): Promise<LockedKimiCodeCredentials> {
-  const release = await acquireKimiCodeRefreshLock(signal);
-  const credential = readKimiCliCredentials();
+  // Resolve the file once so lock, read, and write-back all target the same
+  // slot kimi-code locks (`oauth/<name>` → `oauth/<name>.lock`).
+  const path = discoverKimiCodeCredentialPath();
+  const release = await acquireKimiCodeRefreshLock(path, signal);
+  const credential = readKimiCliCredentials(path);
   return {
     credential,
-    store: writeKimiCodeCredentials,
+    store: (access, refresh, expiresMs) =>
+      writeKimiCodeCredentials(access, refresh, expiresMs, path),
     release,
   };
 }

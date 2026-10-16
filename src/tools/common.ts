@@ -5,6 +5,7 @@ import { PROVIDER_ID, getBaseUrl, normalizeKimiBaseV1 } from "../constants.ts";
 import { getKimiProviderHeaders } from "../device.ts";
 import {
   KIMI_LOGIN_REQUIRED_MESSAGE,
+  readKimiCodeAccessToken,
   readStoredOAuthCredential,
   refreshKimiAuthToken,
 } from "../oauth.ts";
@@ -23,7 +24,7 @@ export interface BuildKimiToolOptions {
 }
 
 function defaultGetAccessToken(): string | null {
-  return readStoredOAuthCredential(PROVIDER_ID)?.access ?? null;
+  return readStoredOAuthCredential(PROVIDER_ID)?.access ?? readKimiCodeAccessToken();
 }
 
 export function buildKimiToolDeps(options: BuildKimiToolOptions = {}): KimiToolDeps {

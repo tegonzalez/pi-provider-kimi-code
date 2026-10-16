@@ -42,6 +42,7 @@ import {
   type KimiToolName,
 } from "./src/config.ts";
 import {
+  KIMI_CODE_CREDENTIAL_API_KEY,
   KIMI_GLOBAL_FALLBACK_SOURCE_ID,
   KIMI_WIRE_PROTOCOLS,
   PROVIDER_ID,
@@ -68,7 +69,9 @@ import {
 } from "./src/models.ts";
 import {
   getKimiApiKey,
+  inferKimiCodeLoginRegion,
   loginKimiCode,
+  readKimiCodeAccessToken,
   refreshKimiAuthToken,
   refreshKimiCodeToken,
 } from "./src/oauth.ts";
@@ -147,7 +150,7 @@ function reloadEffectiveKimiRuntimeConfig(
   // env KIMI_CODE_REGION already sits in the merged config via the env layer)
   // and re-bridge pi core's OAuth host so /login follows settings changes
   // without a restart.
-  setKimiRegionOverride(config.region);
+  setKimiRegionOverride(config.region ?? inferKimiCodeLoginRegion());
   applyKimiRegionEnvBridge();
   setStoreResolvedKimiConfig({
     model: resolveKimiModelConfig(
@@ -556,7 +559,12 @@ async function registerKimiProvider(pi: ExtensionAPI, state: KimiRuntimeState): 
   await registerKimiGlobalApiFallback(state.fallbackSourceId);
   pi.registerProvider(PROVIDER_ID, {
     baseUrl: getBaseUrl(state.config.protocol),
-    apiKey: "$KIMI_API_KEY",
+    // Reuse an existing kimi-code CLI login at runtime (like pi's Claude OAuth
+    // token reuse): no /login and no auth.json seeding. KIMI_API_KEY still wins.
+    apiKey:
+      !process.env.KIMI_API_KEY?.trim() && readKimiCodeAccessToken()
+        ? KIMI_CODE_CREDENTIAL_API_KEY
+        : "$KIMI_API_KEY",
     api: getKimiApiType(state.config.protocol),
     streamSimple: streamSimpleKimi,
 

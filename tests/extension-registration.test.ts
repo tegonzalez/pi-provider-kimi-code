@@ -23,6 +23,10 @@ import {
 import { KIMI_PLATFORM, PROVIDER_ID, getKimiApiType } from "../src/constants.ts";
 import registerKimiCodeExtension, { KimiCode, kimiModelDiscoverySettled } from "../index.ts";
 
+// Keep the developer's real kimi-code login out of these tests: the extension
+// now reuses it at runtime and follows its region when none is configured.
+process.env.KIMI_CODE_HOME = mkdtempSync(join(tmpdir(), "kimi-code-home-empty-"));
+
 function tempDir(name: string): string {
   return mkdtempSync(join(tmpdir(), `${name}-`));
 }

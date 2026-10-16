@@ -151,6 +151,12 @@ export const RETRYABLE_REFRESH_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 export const PROVIDER_ID = "kimi-coding";
 
+// Registered as the provider apiKey when a kimi-code CLI login exists and no
+// KIMI_API_KEY is set: pi then counts kimi-coding as authenticated without an
+// auth.json entry, and resolveKimiApiKey swaps this marker for the live
+// kimi-code access token on every request. Never sent on the wire.
+export const KIMI_CODE_CREDENTIAL_API_KEY = "kimi-code-cli-credential";
+
 // Owner tag for the entries this extension adds to pi-ai's global api-provider
 // registry, so they can be identified and removed as a group.
 export const KIMI_GLOBAL_FALLBACK_SOURCE_ID = "pi-provider-kimi-code-global-fallback";

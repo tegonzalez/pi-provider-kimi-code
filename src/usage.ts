@@ -1,6 +1,10 @@
 import { PROVIDER_ID, getBaseUrl, normalizeKimiBaseV1 } from "./constants.ts";
 import { getKimiProviderHeaders } from "./device.ts";
-import { readStoredOAuthCredential, refreshKimiAuthToken } from "./oauth.ts";
+import {
+  readKimiCodeAccessToken,
+  readStoredOAuthCredential,
+  refreshKimiAuthToken,
+} from "./oauth.ts";
 
 const RESET_TIME_KEYS = [
   "resetTime",
@@ -43,7 +47,7 @@ export function getKimiUsageToken(): string | null {
   const credential = readStoredOAuthCredential(PROVIDER_ID);
   if (credential?.access) return credential.access;
   const apiKey = process.env.KIMI_API_KEY?.trim();
-  return apiKey || null;
+  return apiKey || readKimiCodeAccessToken();
 }
 
 function toNumber(value: unknown): number | null {

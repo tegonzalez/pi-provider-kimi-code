@@ -77,6 +77,7 @@ import {
 
 import {
   ENV_KIMI_CODE_PROTOCOL,
+  KIMI_CODE_CREDENTIAL_API_KEY,
   PROVIDER_ID,
   type KimiWireProtocol,
   getApiProtocol,
@@ -85,6 +86,7 @@ import {
 import { getKimiProviderHeaders } from "./device.ts";
 import {
   isKimiAuthErrorMessage,
+  readKimiCodeAccessToken,
   readStoredOAuthCredential,
   refreshKimiAuthToken,
 } from "./oauth.ts";
@@ -223,12 +225,17 @@ const KIMI_API_KEY_ENV_REFERENCES = new Set(["$KIMI_API_KEY", "${KIMI_API_KEY}"]
 // behind them and pass nothing, so read the same credential store pi itself
 // would have read instead of sending an unauthenticated request. Kept last so
 // an explicit key and the environment override keep their existing precedence.
+// Falls back to the kimi-code CLI's live credential (read in place, never
+// copied into auth.json).
 function getStoredKimiAccessToken(): string {
-  return readStoredOAuthCredential(PROVIDER_ID)?.access?.trim() || "";
+  return readStoredOAuthCredential(PROVIDER_ID)?.access?.trim() || readKimiCodeAccessToken() || "";
 }
 
 export function resolveKimiApiKey(apiKey: string | undefined): string {
-  if (apiKey !== undefined && KIMI_API_KEY_ENV_REFERENCES.has(apiKey)) {
+  if (
+    apiKey !== undefined &&
+    (KIMI_API_KEY_ENV_REFERENCES.has(apiKey) || apiKey === KIMI_CODE_CREDENTIAL_API_KEY)
+  ) {
     return process.env.KIMI_API_KEY?.trim() || getStoredKimiAccessToken();
   }
   return apiKey || process.env.KIMI_API_KEY || getStoredKimiAccessToken();
