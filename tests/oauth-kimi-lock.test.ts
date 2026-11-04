@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { promisify } from "node:util";
 import { lock as acquireFileLock } from "proper-lockfile";
 
 import { PROVIDER_ID } from "../src/constants.ts";
+import { resolveKimiCodeCredentialName } from "../src/oauth.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -17,8 +18,15 @@ interface KimiLockFixture {
   kimiHome: string;
   legacyDir: string;
   tokenUrl: string;
+  /** The exact env-derived credential slot for the fake endpoint binding. */
+  credentialPath: string;
   cleanup(): void;
 }
+
+// The fake endpoints define a custom (non-mainland) binding, so the live
+// credential must live in the exact derived slot — the fixed `kimi-code.json`
+// name is mainland-only now.
+const FAKE_BASE_URL = "https://disabled.invalid";
 
 function fixture(withPiCredential: boolean): KimiLockFixture {
   const dir = mkdtempSync(join(tmpdir(), "pi-kimi-code-lock-"));
@@ -27,6 +35,11 @@ function fixture(withPiCredential: boolean): KimiLockFixture {
   const legacyDir = join(dir, "no-legacy-credentials");
   const tokenUrl = join(dir, "token-state");
   writeFileSync(tokenUrl, "0", "utf8");
+  const credentialPath = join(
+    kimiHome,
+    "credentials",
+    `${resolveKimiCodeCredentialName(tokenUrl, `${FAKE_BASE_URL}/v1`)}.json`,
+  );
   if (withPiCredential) {
     mkdirSync(piAgentDir, { recursive: true });
     writeFileSync(
@@ -37,6 +50,7 @@ function fixture(withPiCredential: boolean): KimiLockFixture {
           access: "stale-access",
           refresh: "refresh-0",
           expires: Date.now() - 1,
+          endpoint: { oauthHost: tokenUrl, baseUrl: `${FAKE_BASE_URL}/v1` },
         },
       }),
       "utf8",
@@ -44,13 +58,14 @@ function fixture(withPiCredential: boolean): KimiLockFixture {
   }
   mkdirSync(join(kimiHome, "credentials"), { recursive: true });
   writeFileSync(
-    join(kimiHome, "credentials", "kimi-code.json"),
+    credentialPath,
     JSON.stringify({
       access_token: "stale-access",
       refresh_token: "refresh-0",
       expires_at: Math.floor(Date.now() / 1000) - 1,
       scope: "",
       token_type: "Bearer",
+      endpoint: { oauthHost: tokenUrl, baseUrl: `${FAKE_BASE_URL}/v1` },
     }),
     "utf8",
   );
@@ -60,6 +75,7 @@ function fixture(withPiCredential: boolean): KimiLockFixture {
     kimiHome,
     legacyDir,
     tokenUrl,
+    credentialPath,
     cleanup() {
       rmSync(dir, { recursive: true, force: true });
     },
@@ -143,9 +159,7 @@ describe("Kimi Code credential locking", () => {
       await Promise.all([runForcedRefresh(f), runForcedRefresh(f)]);
 
       assert.equal(readFileSync(f.tokenUrl, "utf8"), "1");
-      const credential = JSON.parse(
-        readFileSync(join(f.kimiHome, "credentials", "kimi-code.json"), "utf8"),
-      );
+      const credential = JSON.parse(readFileSync(f.credentialPath, "utf8"));
       assert.equal(credential.refresh_token, "refresh-1");
       assert.equal(credential.access_token, "access-1");
       assert.equal(credential.expires_at > Math.floor(Date.now() / 1000), true);
@@ -174,9 +188,7 @@ describe("Kimi Code credential locking", () => {
       ]);
 
       assert.equal(readFileSync(f.tokenUrl, "utf8"), "1");
-      const credential = JSON.parse(
-        readFileSync(join(f.kimiHome, "credentials", "kimi-code.json"), "utf8"),
-      );
+      const credential = JSON.parse(readFileSync(f.credentialPath, "utf8"));
       assert.equal(credential.refresh_token, "refresh-1");
       assert.equal(credential.access_token, "access-1");
       assert.equal(credential.expires_at > Math.floor(Date.now() / 1000), true);
@@ -207,9 +219,7 @@ describe("Kimi Code credential locking", () => {
 
       const attempts = Number(readFileSync(f.tokenUrl, "utf8"));
       assert.equal(attempts >= 1 && attempts <= 2, true);
-      const credential = JSON.parse(
-        readFileSync(join(f.kimiHome, "credentials", "kimi-code.json"), "utf8"),
-      );
+      const credential = JSON.parse(readFileSync(f.credentialPath, "utf8"));
       assert.equal(credential.expires_at > Math.floor(Date.now() / 1000), true);
     } finally {
       f.cleanup();
@@ -218,7 +228,7 @@ describe("Kimi Code credential locking", () => {
 
   it("honors cancellation while waiting for Kimi Code's OAuth lock", async () => {
     const f = fixture(false);
-    const target = join(f.kimiHome, "oauth", "kimi-code");
+    const target = join(f.kimiHome, "oauth", basename(f.credentialPath, ".json"));
     mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, "", { encoding: "utf8", flag: "a" });
     const release = await acquireFileLock(target, { realpath: false, stale: 5_000 });
@@ -228,6 +238,8 @@ describe("Kimi Code credential locking", () => {
       process.env.KIMI_CODE_HOME = f.kimiHome;
       process.env.KIMI_SHARE_DIR = f.legacyDir;
       process.env.KIMI_OAUTH_HOST = f.tokenUrl;
+      process.env.KIMI_BASE_URL = FAKE_BASE_URL;
+      process.env.KIMI_CODE_BASE_URL = FAKE_BASE_URL;
       const { refreshKimiAuthToken } = await import("../src/oauth.ts");
       globalThis.fetch = async () => {
         throw new Error("fetch should not be called while waiting for the lock");
@@ -247,6 +259,8 @@ describe("Kimi Code credential locking", () => {
       delete process.env.KIMI_CODE_HOME;
       delete process.env.KIMI_SHARE_DIR;
       delete process.env.KIMI_OAUTH_HOST;
+      delete process.env.KIMI_BASE_URL;
+      delete process.env.KIMI_CODE_BASE_URL;
       await release();
       f.cleanup();
     }
@@ -264,9 +278,7 @@ describe("Kimi Code credential locking", () => {
       ];
       assert.equal(piCredential.access, "access-1");
       assert.equal(piCredential.refresh, "refresh-1");
-      const kimiCredential = JSON.parse(
-        readFileSync(join(f.kimiHome, "credentials", "kimi-code.json"), "utf8"),
-      );
+      const kimiCredential = JSON.parse(readFileSync(f.credentialPath, "utf8"));
       assert.equal(kimiCredential.refresh_token, "refresh-1");
       assert.equal(kimiCredential.expires_at > Math.floor(Date.now() / 1000), true);
     } finally {
@@ -286,7 +298,7 @@ describe("Kimi Code credential locking", () => {
         maxBuffer: 1024 * 1024,
       });
 
-      const target = join(f.kimiHome, "oauth", "kimi-code");
+      const target = join(f.kimiHome, "oauth", basename(f.credentialPath, ".json"));
       mkdirSync(join(f.kimiHome, "oauth"), { recursive: true });
       writeFileSync(target, "", { encoding: "utf8", flag: "a" });
       const release = await acquireFileLock(target, { realpath: false, stale: 5_000 });
@@ -297,17 +309,15 @@ describe("Kimi Code credential locking", () => {
         scope: "",
         token_type: "Bearer",
       };
-      writeFileSync(
-        join(f.kimiHome, "credentials", "kimi-code.json"),
-        JSON.stringify(staleCredential),
-        "utf8",
-      );
+      writeFileSync(f.credentialPath, JSON.stringify(staleCredential), "utf8");
       await release();
 
       process.env.PI_CODING_AGENT_DIR = f.piAgentDir;
       process.env.KIMI_CODE_HOME = f.kimiHome;
       process.env.KIMI_SHARE_DIR = f.legacyDir;
       process.env.KIMI_OAUTH_HOST = f.tokenUrl;
+      process.env.KIMI_BASE_URL = FAKE_BASE_URL;
+      process.env.KIMI_CODE_BASE_URL = FAKE_BASE_URL;
       process.env.KIMI_DISABLE_OAUTH_LOCK = "1";
       const { refreshKimiAuthToken } = await import("../src/oauth.ts");
       globalThis.fetch = async () => {
@@ -328,9 +338,7 @@ describe("Kimi Code credential locking", () => {
       const recovered = await refreshKimiAuthToken("stale-access");
       assert.equal(recovered, "access-2");
       assert.equal(readFileSync(f.tokenUrl, "utf8"), "2");
-      const kimiCredential = JSON.parse(
-        readFileSync(join(f.kimiHome, "credentials", "kimi-code.json"), "utf8"),
-      );
+      const kimiCredential = JSON.parse(readFileSync(f.credentialPath, "utf8"));
       assert.equal(kimiCredential.access_token, "access-2");
       assert.equal(kimiCredential.refresh_token, "refresh-2");
       assert.equal(kimiCredential.expires_at > Math.floor(Date.now() / 1000), true);
@@ -339,6 +347,8 @@ describe("Kimi Code credential locking", () => {
       delete process.env.KIMI_CODE_HOME;
       delete process.env.KIMI_SHARE_DIR;
       delete process.env.KIMI_OAUTH_HOST;
+      delete process.env.KIMI_BASE_URL;
+      delete process.env.KIMI_CODE_BASE_URL;
       delete process.env.KIMI_DISABLE_OAUTH_LOCK;
       f.cleanup();
     }

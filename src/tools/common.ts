@@ -1,12 +1,18 @@
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 
-import { PROVIDER_ID, getBaseUrl, normalizeKimiBaseV1 } from "../constants.ts";
+import {
+  PROVIDER_ID,
+  canonicalizeKimiEndpointUrl,
+  getBaseUrl,
+  getKimiEndpointBinding,
+  normalizeKimiBaseV1,
+} from "../constants.ts";
 import { getKimiProviderHeaders } from "../device.ts";
 import {
   KIMI_LOGIN_REQUIRED_MESSAGE,
+  readBoundStoredOAuthCredential,
   readKimiCodeAccessToken,
-  readStoredOAuthCredential,
   refreshKimiAuthToken,
 } from "../oauth.ts";
 
@@ -24,7 +30,11 @@ export interface BuildKimiToolOptions {
 }
 
 function defaultGetAccessToken(): string | null {
-  return readStoredOAuthCredential(PROVIDER_ID)?.access ?? readKimiCodeAccessToken();
+  // Only a credential bound to the configured endpoints is sent to them.
+  return (
+    readBoundStoredOAuthCredential(PROVIDER_ID, getKimiEndpointBinding())?.access ??
+    readKimiCodeAccessToken()
+  );
 }
 
 export function buildKimiToolDeps(options: BuildKimiToolOptions = {}): KimiToolDeps {
@@ -65,6 +75,15 @@ export function getKimiDatasourceUrl(): string {
   const explicit = process.env.KIMI_DATASOURCE_API_URL?.trim();
   if (explicit) return explicit;
   return `${getKimiBaseV1()}/tools`;
+}
+
+/** An OAuth token may go to the datasource endpoint only when that endpoint
+ * is exactly the tools endpoint the credential is bound to. A custom
+ * KIMI_DATASOURCE_API_URL that points anywhere else never receives one. */
+export function kimiDatasourceUrlAcceptsOAuth(url: string): boolean {
+  return (
+    canonicalizeKimiEndpointUrl(url) === canonicalizeKimiEndpointUrl(`${getKimiBaseV1()}/tools`)
+  );
 }
 
 export function buildHeaders(accessToken: string, toolCallId: string): Record<string, string> {

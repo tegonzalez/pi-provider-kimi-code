@@ -1989,12 +1989,16 @@ describe("global api-provider fallback", () => {
     const { port } = server.address() as AddressInfo;
     // A caller arriving through the global registry has no ModelRuntime behind
     // it and supplies no credential, and an OAuth user has no KIMI_API_KEY in
-    // the environment either.
+    // the environment either. The stored credential records the binding of
+    // the endpoints the stream is configured to call — only a credential
+    // bound to those endpoints is used.
+    const testOAuthHost = "https://auth.kimi.test";
     const auth = withTempAuthFile({
       type: "oauth",
       access: "stored-oauth-token",
       refresh: "refresh-token",
       expires: Date.now() + 60_000,
+      endpoint: { oauthHost: testOAuthHost, baseUrl: `http://127.0.0.1:${port}/v1` },
     });
 
     // KIMI_CODE_PROTOCOL is read at module load, so a developer machine
@@ -2007,7 +2011,11 @@ describe("global api-provider fallback", () => {
       const { pi, providerConfigs } = makePi();
 
       await withEnv(
-        { KIMI_API_KEY: undefined, KIMI_CODE_BASE_URL: `http://127.0.0.1:${port}/v1` },
+        {
+          KIMI_API_KEY: undefined,
+          KIMI_CODE_BASE_URL: `http://127.0.0.1:${port}/v1`,
+          KIMI_CODE_OAUTH_HOST: testOAuthHost,
+        },
         async () => {
           await withCwd(cwd, () => registerKimiCodeExtension(pi));
 

@@ -5,6 +5,7 @@ import {
   type BuildKimiToolOptions,
   buildHeaders,
   getKimiDatasourceUrl,
+  kimiDatasourceUrlAcceptsOAuth,
   buildKimiToolDeps,
   buildTimeoutSignal,
   errorResult,
@@ -177,6 +178,12 @@ export function buildKimiDatasourceTool(options: BuildKimiToolOptions = {}) {
     parameters: kimiDatasourceSchema,
 
     async execute(toolCallId, params, signal) {
+      const datasourceUrl = getKimiDatasourceUrl();
+      if (!kimiDatasourceUrlAcceptsOAuth(datasourceUrl)) {
+        return errorResult<string>(
+          "kimi_datasource is configured with KIMI_DATASOURCE_API_URL, which is not the tools endpoint the OAuth credential is bound to. OAuth tokens are never sent to a custom datasource URL; unset KIMI_DATASOURCE_API_URL or point it at the bound tools endpoint.",
+        );
+      }
       const accessToken = deps.getAccessToken();
       if (!accessToken) {
         return errorResult<string>(
@@ -202,7 +209,7 @@ export function buildKimiDatasourceTool(options: BuildKimiToolOptions = {}) {
             };
 
         const response = await fetchWithAuthRetry(deps, accessToken, (token) =>
-          deps.fetch(getKimiDatasourceUrl(), {
+          deps.fetch(datasourceUrl, {
             method: "POST",
             headers: buildHeaders(token, toolCallId),
             body: JSON.stringify(body),

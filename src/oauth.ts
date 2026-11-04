@@ -10,7 +10,6 @@ import {
   fsyncSync,
   mkdirSync,
   openSync,
-  readdirSync,
   readFileSync,
   renameSync,
   statSync,
@@ -36,6 +35,10 @@ export interface StoredOAuthCredential {
   access: string;
   refresh: string;
   expires: number;
+  /** Non-secret endpoint binding this credential was minted for. Absent on
+   * pre-binding credentials: those are accepted only at the official
+   * mainland default binding. */
+  endpoint?: { oauthHost: string; baseUrl: string };
   [key: string]: unknown;
 }
 
@@ -59,6 +62,39 @@ export function readStoredOAuthCredential(providerId: string): StoredOAuthCreden
     ? piAgentRuntime.readStoredCredential(providerId)
     : piAgentRuntime.AuthStorage?.create().get(providerId);
   return credential?.type === "oauth" ? (credential as StoredOAuthCredential) : null;
+}
+
+// Binding-match rule shared by pi's stored credential and the in-flight lock
+// read: unbound legacy credentials count only at the official mainland
+// default binding; bound credentials must match exactly.
+function storedCredentialMatchesBinding(
+  credential: StoredOAuthCredential | null,
+  binding: KimiEndpointBinding,
+): credential is StoredOAuthCredential {
+  if (!credential) return false;
+  if (!credential.endpoint) return isMainlandKimiEndpointBinding(binding);
+  const endpoint = credential.endpoint;
+  if (typeof endpoint.oauthHost !== "string" || typeof endpoint.baseUrl !== "string") return false;
+  return kimiEndpointBindingsEqual(
+    {
+      oauthHost: canonicalizeKimiEndpointUrl(endpoint.oauthHost),
+      baseUrl: canonicalizeKimiEndpointUrl(endpoint.baseUrl),
+    },
+    binding,
+  );
+}
+
+// Binding-checked read of pi's stored credential: a credential recorded for a
+// different (oauthHost, baseUrl) pair is never handed out. Credentials written
+// before binding metadata existed are accepted only at the official mainland
+// default binding; anywhere else they are ignored so the user gets a fresh
+// login instead of a token sent to the wrong endpoint.
+export function readBoundStoredOAuthCredential(
+  providerId: string,
+  binding: KimiEndpointBinding,
+): StoredOAuthCredential | null {
+  const credential = readStoredOAuthCredential(providerId);
+  return storedCredentialMatchesBinding(credential, binding) ? credential : null;
 }
 
 // Mutual exclusion with pi's own credential writes: use the same library
@@ -175,12 +211,18 @@ async function lockStoredOAuthCredential(
 
 import {
   CLIENT_ID,
+  KIMI_MAINLAND_ENDPOINT_BINDING,
   KIMI_REGION_PROFILES,
+  type KimiEndpointBinding,
   type KimiRegion,
   PROVIDER_ID,
   RETRYABLE_REFRESH_STATUSES,
+  canonicalizeKimiEndpointUrl,
   getBaseUrl,
+  getKimiEndpointBinding,
   getOAuthHost,
+  isMainlandKimiEndpointBinding,
+  kimiEndpointBindingsEqual,
   normalizeKimiBaseV1,
 } from "./constants.ts";
 import { getCommonHeaders } from "./device.ts";
@@ -294,6 +336,10 @@ interface RefreshAccessTokenOptions {
   maxRetries?: number;
   signal?: AbortSignal;
   sleep?: (ms: number) => Promise<void>;
+  /** The OAuth host that minted the refresh token. A refresh token is only
+   * ever posted to its own host, never to an ambient override. Defaults to
+   * the configured host for direct/test callers. */
+  oauthHost?: string;
 }
 
 export const KIMI_LOGIN_REQUIRED_MESSAGE =
@@ -328,12 +374,13 @@ export async function refreshAccessToken(
 ): Promise<TokenResponse> {
   const maxRetries = options.maxRetries ?? 3;
   const wait = options.sleep ?? ((ms: number) => sleep(ms, options.signal));
+  const oauthHost = canonicalizeKimiEndpointUrl(options.oauthHost ?? getOAuthHost());
   let lastError: unknown;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       options.signal?.throwIfAborted();
-      const response = await fetch(`${getOAuthHost()}/api/oauth/token`, {
+      const response = await fetch(`${oauthHost}/api/oauth/token`, {
         method: "POST",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
@@ -404,25 +451,47 @@ interface KimiCliCredentialsFile {
   scope?: string;
   token_type?: string;
   expires_in?: number;
+  /** Non-secret binding of the endpoints this credential was minted for.
+   * Written by this extension; the upstream CLI ignores unknown fields. */
+  endpoint?: { oauthHost?: string; baseUrl?: string };
 }
 
 function getKimiCodeHome(): string {
   return process.env.KIMI_CODE_HOME || join(os.homedir(), ".kimi-code");
 }
 
+function getKimiShareDir(): string {
+  return process.env.KIMI_SHARE_DIR || join(os.homedir(), ".kimi");
+}
+
+// Which on-disk slot a credential read/write targets, and the binding it must
+// match. `derived` is the exact slot hashed from the current binding (an
+// unbound file there inherits the binding encoded in its filename); the two
+// legacy kinds exist only at the official mainland binding.
+export interface KimiCredentialSelection {
+  path: string;
+  binding: KimiEndpointBinding;
+  kind: "derived" | "fixed-legacy" | "share-legacy";
+}
+
 // Mirrors kimi-code's resolveKimiCodeOAuthKey (packages/oauth/src/managed-kimi-code.ts):
 // the default mainland endpoints share the `kimi-code` slot; any other
-// (oauthHost, baseUrl) pair gets `kimi-code-env-<sha256(json)[:16]>`. Deriving
-// it from the endpoints pi is about to call keeps token and endpoint matched.
-// Exported for tests.
+// (oauthHost, baseUrl) pair gets `kimi-code-env-<sha256(json)[:16]>`. The
+// digest input is the canonical pair, so a credential file created by the
+// upstream CLI for the same endpoints resolves to the same slot. Exported for
+// tests.
 export function resolveKimiCodeCredentialName(
   oauthHost: string = getOAuthHost(),
   baseUrl: string = normalizeKimiBaseV1(getBaseUrl()),
 ): string {
-  const host = oauthHost.trim().replace(/\/+$/, "");
-  const base = baseUrl.trim().replace(/\/+$/, "");
-  const mainland = KIMI_REGION_PROFILES["mainland-cn"];
-  if (host === mainland.oauthHost && base === `${mainland.apiBase}/coding/v1`) return "kimi-code";
+  const host = canonicalizeKimiEndpointUrl(oauthHost);
+  const base = canonicalizeKimiEndpointUrl(baseUrl);
+  if (
+    host === KIMI_MAINLAND_ENDPOINT_BINDING.oauthHost &&
+    base === KIMI_MAINLAND_ENDPOINT_BINDING.baseUrl
+  ) {
+    return "kimi-code";
+  }
   const digest = createHash("sha256")
     .update(JSON.stringify({ oauthHost: host, baseUrl: base }))
     .digest("hex")
@@ -430,25 +499,38 @@ export function resolveKimiCodeCredentialName(
   return `kimi-code-env-${digest}`;
 }
 
-// The live kimi-code credential file, shared in place with the CLI (never
-// copied). Order: the slot kimi-code derives for pi's endpoints, then the
-// newest `kimi-code-env-*.json`, then the legacy `kimi-code.json`. With none
-// present, the derived slot is where a fresh login lands. Exported for tests.
-export function discoverKimiCodeCredentialPath(): string {
+// Exact-slot selection. There is deliberately no newest-env fallback: a
+// token minted for one endpoint pair must never be picked up for another.
+// Exported for tests.
+export function selectKimiCodeCredential(
+  binding: KimiEndpointBinding = getKimiEndpointBinding(),
+): KimiCredentialSelection {
   const credentialsDir = join(getKimiCodeHome(), "credentials");
-  const derived = join(credentialsDir, `${resolveKimiCodeCredentialName()}.json`);
-  if (existsSync(derived)) return derived;
-  try {
-    const envFiles = readdirSync(credentialsDir)
-      .filter((name) => /^kimi-code-env-[^.]+\.json$/.test(name))
-      .map((name) => ({ name, mtimeMs: statSync(join(credentialsDir, name)).mtimeMs }))
-      .sort((a, b) => b.mtimeMs - a.mtimeMs);
-    if (envFiles.length > 0) return join(credentialsDir, envFiles[0].name);
-  } catch {
-    // credentials dir missing or unreadable — fall through.
+  const derived = join(
+    credentialsDir,
+    `${resolveKimiCodeCredentialName(binding.oauthHost, binding.baseUrl)}.json`,
+  );
+  if (existsSync(derived)) return { path: derived, binding, kind: "derived" };
+  if (isMainlandKimiEndpointBinding(binding)) {
+    const legacy = join(credentialsDir, "kimi-code.json");
+    if (existsSync(legacy)) {
+      return { path: legacy, binding: KIMI_MAINLAND_ENDPOINT_BINDING, kind: "fixed-legacy" };
+    }
+    const shareLegacy = join(getKimiShareDir(), "credentials", "kimi-code.json");
+    if (existsSync(shareLegacy)) {
+      return { path: shareLegacy, binding: KIMI_MAINLAND_ENDPOINT_BINDING, kind: "share-legacy" };
+    }
   }
-  const legacy = join(credentialsDir, "kimi-code.json");
-  return existsSync(legacy) ? legacy : derived;
+  // Nothing on disk: the derived slot for the current binding is where a
+  // fresh login lands.
+  return { path: derived, binding, kind: "derived" };
+}
+
+// The live kimi-code credential file, shared in place with the CLI (never
+// copied): only the exact slot for the current binding, or — at the official
+// mainland binding — the fixed legacy file. Exported for tests.
+export function discoverKimiCodeCredentialPath(): string {
+  return selectKimiCodeCredential().path;
 }
 
 // With no region from pi config or KIMI_CODE_REGION, follow the kimi-code
@@ -471,25 +553,40 @@ export function inferKimiCodeLoginRegion(): KimiRegion | null {
   return best?.region ?? null;
 }
 
-function getKimiCredentialPaths(credentialPath = discoverKimiCodeCredentialPath()): string[] {
-  const shareDir = process.env.KIMI_SHARE_DIR || join(os.homedir(), ".kimi");
-  return [...new Set([credentialPath, join(shareDir, "credentials", "kimi-code.json")])];
+// The binding a credential file effectively carries: its recorded endpoint,
+// or — for files written before binding metadata — the binding its slot
+// encodes. A file whose effective binding differs from the selection's is
+// never used.
+function credentialFileBinding(
+  data: KimiCliCredentialsFile,
+  selection: KimiCredentialSelection,
+): KimiEndpointBinding | null {
+  const endpoint = data.endpoint;
+  if (endpoint !== undefined) {
+    if (typeof endpoint.oauthHost !== "string" || typeof endpoint.baseUrl !== "string") {
+      return null;
+    }
+    return {
+      oauthHost: canonicalizeKimiEndpointUrl(endpoint.oauthHost),
+      baseUrl: canonicalizeKimiEndpointUrl(endpoint.baseUrl),
+    };
+  }
+  return selection.kind === "derived" ? selection.binding : KIMI_MAINLAND_ENDPOINT_BINDING;
 }
 
 function readKimiCliCredentials(
-  credentialPath = discoverKimiCodeCredentialPath(),
+  selection: KimiCredentialSelection = selectKimiCodeCredential(),
 ): KimiCliCredentialsFile | null {
-  for (const path of getKimiCredentialPaths(credentialPath)) {
-    try {
-      if (!existsSync(path)) continue;
-      const data = JSON.parse(readFileSync(path, "utf-8")) as KimiCliCredentialsFile;
-      if (!data.access_token || !data.refresh_token) continue;
-      return data;
-    } catch {
-      continue;
-    }
+  try {
+    if (!existsSync(selection.path)) return null;
+    const data = JSON.parse(readFileSync(selection.path, "utf-8")) as KimiCliCredentialsFile;
+    if (!data.access_token || !data.refresh_token) return null;
+    const binding = credentialFileBinding(data, selection);
+    if (!binding || !kimiEndpointBindingsEqual(binding, selection.binding)) return null;
+    return data;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 // Runtime reuse (no auth.json seeding): the kimi-code credential translated to
@@ -500,12 +597,14 @@ export function readKimiCodeAccessToken(): string | null {
 
 // Same write protocol as kimi-code's FileTokenStorage.save: temp file in the
 // same dir, fsync, chmod 0600, rename — readers never see a partial file.
+// Every write records the binding the credential was minted for.
 function writeKimiCodeCredentials(
   access: string,
   refresh: string,
   expiresMs: number,
-  path: string = discoverKimiCodeCredentialPath(),
+  selection: KimiCredentialSelection = selectKimiCodeCredential(),
 ): void {
+  const path = selection.path;
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const data: KimiCliCredentialsFile = {
@@ -515,6 +614,7 @@ function writeKimiCodeCredentials(
     scope: "",
     token_type: "Bearer",
     expires_in: Math.max(0, Math.floor((expiresMs - Date.now()) / 1000)),
+    endpoint: { ...selection.binding },
   };
   const tmp = `${path}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
   const bytes = Buffer.from(`${JSON.stringify(data, null, 2)}\n`, "utf-8");
@@ -541,47 +641,56 @@ function writeKimiCodeCredentials(
 
 interface LockedKimiCodeCredentials {
   credential: KimiCliCredentialsFile | null;
+  /** The path+binding snapshot this lock covers; reuse it for every read and
+   * write-back in the transaction so a mid-flight env change cannot redirect
+   * tokens to another endpoint. */
+  selection: KimiCredentialSelection;
   store(access: string, refresh: string, expiresMs: number): void;
   release(): Promise<void>;
 }
 
 async function lockKimiCodeCredentials(signal?: AbortSignal): Promise<LockedKimiCodeCredentials> {
-  // Resolve the file once so lock, read, and write-back all target the same
-  // slot kimi-code locks (`oauth/<name>` → `oauth/<name>.lock`).
-  const path = discoverKimiCodeCredentialPath();
-  const release = await acquireKimiCodeRefreshLock(path, signal);
-  const credential = readKimiCliCredentials(path);
+  // Resolve the file and binding once so lock, read, and write-back all target
+  // the same slot kimi-code locks (`oauth/<name>` → `oauth/<name>.lock`).
+  const selection = selectKimiCodeCredential();
+  const release = await acquireKimiCodeRefreshLock(selection.path, signal);
+  const credential = readKimiCliCredentials(selection);
   return {
     credential,
+    selection,
     store: (access, refresh, expiresMs) =>
-      writeKimiCodeCredentials(access, refresh, expiresMs, path),
+      writeKimiCodeCredentials(access, refresh, expiresMs, selection),
     release,
   };
 }
 
-// Tokens are region-bound, but the kimi-code CLI credential file does not
-// record which OAuth host minted them — so a fresh credential reused across
-// regions (a mainland CLI login while KIMI_CODE_REGION=global, or vice versa)
-// would 401 every request. Probe the current region's managed API before
-// reuse. Only an explicit 401 disproves usability: network failures must not
-// force an unnecessary re-login. Exported for tests.
-export async function isKimiCredentialRegionValid(accessToken: string): Promise<boolean> {
-  const meUrl = `${normalizeKimiBaseV1(getBaseUrl())}/me`;
+// Tokens are region-bound, and the credential records which OAuth host minted
+// them. Only a credential whose binding exactly matches the endpoints pi is
+// configured to call is reused or refreshed; the probe below fails closed —
+// only an explicit 2xx proves the token is usable, because a network error or
+// a non-2xx means the token may be bound to a different deployment.
+// Exported for tests.
+export async function isKimiCredentialRegionValid(
+  accessToken: string,
+  baseUrl: string = normalizeKimiBaseV1(getBaseUrl()),
+): Promise<boolean> {
+  const meUrl = `${baseUrl}/me`;
   try {
     const response = await fetch(meUrl, {
       headers: { ...getCommonHeaders(), Authorization: `Bearer ${accessToken}` },
       signal: AbortSignal.timeout(5_000),
     });
-    return response.status !== 401;
+    return response.ok;
   } catch {
-    return true;
+    return false;
   }
 }
 
 async function tryReuseKimiCliCredentials(
   callbacks: OAuthLoginCallbacks,
 ): Promise<KimiOAuthCredentials | null> {
-  const data = readKimiCliCredentials();
+  const selection = selectKimiCodeCredential();
+  const data = readKimiCliCredentials(selection);
   if (!data) return null;
 
   const expiresAtMs = typeof data.expires_at === "number" ? data.expires_at * 1000 : 0;
@@ -592,9 +701,9 @@ async function tryReuseKimiCliCredentials(
   callbacks.onProgress?.("Found existing Kimi credentials, reusing them.");
 
   if (stillFresh) {
-    if (!(await isKimiCredentialRegionValid(data.access_token!))) {
+    if (!(await isKimiCredentialRegionValid(data.access_token!, selection.binding.baseUrl))) {
       callbacks.onProgress?.(
-        "Existing Kimi credentials are not valid for the configured region, starting a fresh login.",
+        "Existing Kimi credentials are not valid for the configured endpoints, starting a fresh login.",
       );
       return null;
     }
@@ -609,18 +718,21 @@ async function tryReuseKimiCliCredentials(
 
   callbacks.onProgress?.("Kimi access token expired, refreshing.");
   try {
-    const token = await refreshAccessToken(data.refresh_token!);
-    // Probe before persisting: a token that fails the region check must not
+    // Post the refresh token only to the host that minted it.
+    const token = await refreshAccessToken(data.refresh_token!, {
+      oauthHost: selection.binding.oauthHost,
+    });
+    // Probe before persisting: a token that fails the binding check must not
     // be written into the shared CLI credential file, or a later CLI-side
     // reuse (or the next /login) would pick up a token that 401s.
-    if (!(await isKimiCredentialRegionValid(token.access_token))) {
+    if (!(await isKimiCredentialRegionValid(token.access_token, selection.binding.baseUrl))) {
       callbacks.onProgress?.(
-        "Refreshed Kimi credentials are not valid for the configured region, starting a fresh login.",
+        "Refreshed Kimi credentials are not valid for the configured endpoints, starting a fresh login.",
       );
       return null;
     }
     const expiresMs = Date.now() + token.expires_in * 1000;
-    writeKimiCodeCredentials(token.access_token, token.refresh_token, expiresMs);
+    writeKimiCodeCredentials(token.access_token, token.refresh_token, expiresMs, selection);
     const extras = await discoverKimiModelMetadata(token.access_token);
     return {
       access: token.access_token,
@@ -694,7 +806,14 @@ export async function loginKimiCode(callbacks: OAuthLoginCallbacks): Promise<Kim
 
     if (token) {
       const expiresMs = Date.now() + token.expires_in * 1000;
-      writeKimiCodeCredentials(token.access_token, token.refresh_token, expiresMs);
+      // A fresh login mints a credential for the endpoints configured right
+      // now; record the binding with it in the exact derived slot.
+      writeKimiCodeCredentials(
+        token.access_token,
+        token.refresh_token,
+        expiresMs,
+        selectKimiCodeCredential(),
+      );
       const extras = await discoverKimiModelMetadata(token.access_token);
       return {
         access: token.access_token,
@@ -709,23 +828,84 @@ export async function loginKimiCode(callbacks: OAuthLoginCallbacks): Promise<Kim
 }
 
 export async function refreshKimiCodeToken(
-  credentials: OAuthCredentials,
+  _credentials: OAuthCredentials,
 ): Promise<KimiOAuthCredentials> {
+  // pi may hand us a credential written before binding metadata existed, or
+  // one bound to a different endpoint pair than pi is configured for now; the
+  // store — checked against the current binding — is authoritative.
+  const binding = getKimiEndpointBinding();
+  const piStored = readBoundStoredOAuthCredential(PROVIDER_ID, binding);
   const kimiLocked = await lockKimiCodeCredentials();
   try {
+    if (!piStored) {
+      // No binding-valid pi credential: refresh the kimi-code CLI credential
+      // for this endpoint pair instead, if there is one.
+      const kimiCred = kimiLocked.credential;
+      if (!kimiCred?.refresh_token) throw new KimiLoginRequiredError();
+      const kimiExpiresMs = (kimiCred.expires_at ?? 0) * 1000;
+      if (kimiCred.access_token && Date.now() < kimiExpiresMs) {
+        const extras = await discoverKimiModelMetadata(kimiCred.access_token);
+        return {
+          access: kimiCred.access_token,
+          refresh: kimiCred.refresh_token,
+          expires: kimiExpiresMs,
+          ...extras,
+        };
+      }
+      let token: Awaited<ReturnType<typeof refreshAccessToken>>;
+      try {
+        token = await refreshAccessToken(kimiCred.refresh_token, {
+          oauthHost: binding.oauthHost,
+        });
+      } catch (error) {
+        // Lock-disabled platforms coordinate only through the sidecar: a peer
+        // may have rotated it while this process was exchanging the stale
+        // refresh token. Adopt the newer credential when it is bound to this
+        // endpoint pair; otherwise surface the original failure.
+        await sleep(100);
+        const peerCredential = readKimiCliCredentials(kimiLocked.selection);
+        const peerAccess = peerCredential?.access_token;
+        const peerRefresh = peerCredential?.refresh_token;
+        const peerExpiresMs = (peerCredential?.expires_at ?? 0) * 1000;
+        if (
+          peerAccess !== undefined &&
+          peerRefresh !== undefined &&
+          peerAccess !== kimiCred.access_token &&
+          Date.now() < peerExpiresMs
+        ) {
+          const extras = await discoverKimiModelMetadata(peerAccess);
+          return {
+            access: peerAccess,
+            refresh: peerRefresh,
+            expires: peerExpiresMs,
+            ...extras,
+          };
+        }
+        throw error;
+      }
+      const expiresMs = Date.now() + token.expires_in * 1000;
+      kimiLocked.store(token.access_token, token.refresh_token, expiresMs);
+      const extras = await discoverKimiModelMetadata(token.access_token);
+      return {
+        access: token.access_token,
+        refresh: token.refresh_token,
+        expires: expiresMs,
+        ...extras,
+      };
+    }
     const initialKimiCred = kimiLocked.credential;
     const initialKimiExpiresMs = (initialKimiCred?.expires_at ?? 0) * 1000;
     const peerHasNewerValidAccess =
       initialKimiCred?.access_token !== undefined &&
-      initialKimiCred.access_token !== credentials.access &&
+      initialKimiCred.access_token !== piStored.access &&
       Date.now() < initialKimiExpiresMs;
     const activeRefreshToken = peerHasNewerValidAccess
       ? initialKimiCred.refresh_token!
-      : credentials.refresh;
+      : piStored.refresh;
     const activeAccessToken = peerHasNewerValidAccess
       ? initialKimiCred.access_token!
-      : credentials.access;
-    if (peerHasNewerValidAccess && initialKimiCred.refresh_token !== credentials.refresh) {
+      : piStored.access;
+    if (peerHasNewerValidAccess && initialKimiCred.refresh_token !== piStored.refresh) {
       const extras = await discoverKimiModelMetadata(activeAccessToken);
       return {
         access: activeAccessToken,
@@ -736,22 +916,23 @@ export async function refreshKimiCodeToken(
     }
     let token: Awaited<ReturnType<typeof refreshAccessToken>>;
     try {
-      token = await refreshAccessToken(activeRefreshToken);
+      token = await refreshAccessToken(activeRefreshToken, { oauthHost: binding.oauthHost });
     } catch (error) {
       // Lock-disabled platforms (Windows / KIMI_DISABLE_OAUTH_LOCK=1) use
       // storage re-read as the only coordinator. A peer may have rotated the
       // shared sidecar while this process was exchanging the old refresh
       // token; recover from that newer valid credential instead of surfacing
-      // the stale-token invalid_grant as a login failure.
+      // the stale-token invalid_grant as a login failure. Only a credential
+      // bound to this endpoint pair is adopted.
       await sleep(100);
-      const peerCredential = readKimiCliCredentials();
+      const peerCredential = readKimiCliCredentials(kimiLocked.selection);
       const peerAccess = peerCredential?.access_token;
       const peerRefresh = peerCredential?.refresh_token;
       const peerExpiresMs = (peerCredential?.expires_at ?? 0) * 1000;
       if (
         peerAccess !== undefined &&
         peerRefresh !== undefined &&
-        peerAccess !== credentials.access &&
+        peerAccess !== piStored.access &&
         Date.now() < peerExpiresMs
       ) {
         const extras = await discoverKimiModelMetadata(peerAccess);
@@ -765,7 +946,7 @@ export async function refreshKimiCodeToken(
       throw error;
     }
     const expiresMs = Date.now() + token.expires_in * 1000;
-    const kimiCredentialAfterRefresh = readKimiCliCredentials();
+    const kimiCredentialAfterRefresh = readKimiCliCredentials(kimiLocked.selection);
     const peerAccess = kimiCredentialAfterRefresh?.access_token;
     const peerRefresh = kimiCredentialAfterRefresh?.refresh_token;
     const peerExpiresMs = (kimiCredentialAfterRefresh?.expires_at ?? 0) * 1000;
@@ -830,11 +1011,16 @@ export async function refreshKimiAuthToken(
   currentKey: string,
   options: { signal?: AbortSignal } = {},
 ): Promise<string | null> {
+  // Snapshot the endpoint binding for the whole transaction: every read,
+  // refresh, and write-back below is scoped to this pair.
+  const binding = getKimiEndpointBinding();
   let locked: LockedOAuthCredential | undefined;
   let kimiLocked: LockedKimiCodeCredentials | undefined;
   try {
     locked = await lockStoredOAuthCredential(PROVIDER_ID, options.signal);
-    const piOAuth = locked.credential;
+    const piOAuth = storedCredentialMatchesBinding(locked.credential, binding)
+      ? locked.credential
+      : null;
 
     if (piOAuth) {
       if (piOAuth.access !== currentKey && Date.now() < piOAuth.expires) {
@@ -844,9 +1030,12 @@ export async function refreshKimiAuthToken(
       let refreshed: Awaited<ReturnType<typeof refreshAccessToken>>;
       kimiLocked = await lockKimiCodeCredentials(options.signal);
       try {
-        refreshed = await refreshAccessToken(piOAuth.refresh, { signal: options.signal });
+        refreshed = await refreshAccessToken(piOAuth.refresh, {
+          signal: options.signal,
+          oauthHost: binding.oauthHost,
+        });
       } catch (error) {
-        const kimiCred = readKimiCliCredentials();
+        const kimiCred = readKimiCliCredentials(kimiLocked.selection);
         if (!kimiCred?.refresh_token || kimiCred.refresh_token === piOAuth.refresh) throw error;
         const kimiExpiresMs = (kimiCred.expires_at ?? 0) * 1000;
         if (kimiCred.access_token !== currentKey && Date.now() < kimiExpiresMs) {
@@ -856,15 +1045,19 @@ export async function refreshKimiAuthToken(
             access: kimiCred.access_token!,
             refresh: kimiCred.refresh_token,
             expires: kimiExpiresMs,
+            endpoint: { ...binding },
           };
           locked.store(recovered);
           return recovered.access;
         }
-        refreshed = await refreshAccessToken(kimiCred.refresh_token, { signal: options.signal });
+        refreshed = await refreshAccessToken(kimiCred.refresh_token, {
+          signal: options.signal,
+          oauthHost: binding.oauthHost,
+        });
       }
 
       const newExpiresMs = Date.now() + refreshed.expires_in * 1000;
-      const kimiCredentialAfterRefresh = readKimiCliCredentials();
+      const kimiCredentialAfterRefresh = readKimiCliCredentials(kimiLocked.selection);
       const peerAccess = kimiCredentialAfterRefresh?.access_token;
       const peerExpiresMs = (kimiCredentialAfterRefresh?.expires_at ?? 0) * 1000;
       const peerIsNewerValid =
@@ -876,6 +1069,7 @@ export async function refreshKimiAuthToken(
           access: peerAccess,
           refresh: kimiCredentialAfterRefresh!.refresh_token!,
           expires: peerExpiresMs,
+          endpoint: { ...binding },
         };
         locked.store(peerCred);
         return peerCred.access;
@@ -887,6 +1081,7 @@ export async function refreshKimiAuthToken(
         access: refreshed.access_token,
         refresh: refreshed.refresh_token,
         expires: newExpiresMs,
+        endpoint: { ...binding },
       };
       locked.store(newCred);
       return newCred.access;
@@ -905,9 +1100,10 @@ export async function refreshKimiAuthToken(
 
     const refreshed = await refreshAccessToken(kimiCred.refresh_token!, {
       signal: options.signal,
+      oauthHost: binding.oauthHost,
     });
     const newExpiresMs = Date.now() + refreshed.expires_in * 1000;
-    const kimiCredentialAfterRefresh = readKimiCliCredentials();
+    const kimiCredentialAfterRefresh = readKimiCliCredentials(kimiLocked.selection);
     const peerAccess = kimiCredentialAfterRefresh?.access_token;
     const peerExpiresMs = (kimiCredentialAfterRefresh?.expires_at ?? 0) * 1000;
     if (peerAccess !== undefined && peerAccess !== currentKey && Date.now() < peerExpiresMs) {

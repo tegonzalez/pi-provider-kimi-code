@@ -241,6 +241,7 @@ describe("kimi_datasource datasource", () => {
 
   it("uses KIMI_DATASOURCE_API_URL when provided", async () => {
     const original = process.env.KIMI_DATASOURCE_API_URL;
+    const originalBase = process.env.KIMI_CODE_BASE_URL;
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const mockFetch: typeof fetch = async (input, init) => {
       calls.push({ url: String(input), init: init ?? {} });
@@ -251,7 +252,10 @@ describe("kimi_datasource datasource", () => {
     };
 
     try {
-      process.env.KIMI_DATASOURCE_API_URL = "https://proxy.example.com/tools";
+      // The override names the tools endpoint of the bound base URL, so the
+      // OAuth token may be sent there.
+      process.env.KIMI_CODE_BASE_URL = "https://proxy.example.com";
+      process.env.KIMI_DATASOURCE_API_URL = "https://proxy.example.com/v1/tools";
       const tool = buildKimiDatasourceTool({
         deps: { fetch: mockFetch, getAccessToken: () => "oauth-token" },
       });
@@ -266,9 +270,41 @@ describe("kimi_datasource datasource", () => {
     } finally {
       if (original === undefined) delete process.env.KIMI_DATASOURCE_API_URL;
       else process.env.KIMI_DATASOURCE_API_URL = original;
+      if (originalBase === undefined) delete process.env.KIMI_CODE_BASE_URL;
+      else process.env.KIMI_CODE_BASE_URL = originalBase;
     }
 
-    assert.equal(calls[0].url, "https://proxy.example.com/tools");
+    assert.equal(calls[0].url, "https://proxy.example.com/v1/tools");
+  });
+
+  it("refuses to send OAuth credentials to a mismatched datasource override", async () => {
+    const original = process.env.KIMI_DATASOURCE_API_URL;
+    const calls: string[] = [];
+    const mockFetch: typeof fetch = async (input) => {
+      calls.push(String(input));
+      return new Response("{}", { status: 200 });
+    };
+
+    try {
+      process.env.KIMI_DATASOURCE_API_URL = "https://proxy.example.com/tools";
+      const tool = buildKimiDatasourceTool({
+        deps: { fetch: mockFetch, getAccessToken: () => "oauth-token" },
+      });
+
+      const result = await tool.execute(
+        "tool-call-1",
+        { data_source_name: "arxiv" },
+        undefined,
+        undefined,
+        undefined as never,
+      );
+      // Fail closed: no request is made and no token leaves the machine.
+      assert.deepEqual(calls, []);
+      assert.match(resultText(result), /never sent to a custom datasource URL/);
+    } finally {
+      if (original === undefined) delete process.env.KIMI_DATASOURCE_API_URL;
+      else process.env.KIMI_DATASOURCE_API_URL = original;
+    }
   });
 
   it("renders datasource result collapsed by default", () => {

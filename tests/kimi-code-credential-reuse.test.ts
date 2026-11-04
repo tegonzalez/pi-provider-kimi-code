@@ -22,6 +22,7 @@ import { KIMI_CODE_CREDENTIAL_API_KEY } from "../src/constants.ts";
 import {
   discoverKimiCodeCredentialPath,
   inferKimiCodeLoginRegion,
+  isKimiCredentialRegionValid,
   readKimiCodeAccessToken,
   refreshKimiAuthToken,
   resolveKimiCodeCredentialName,
@@ -100,18 +101,81 @@ describe("kimi-code credential discovery", () => {
     assert.equal(resolveKimiCodeCredentialName(), GLOBAL_NAME); // from env endpoints
   });
 
-  it("prefers the derived slot, then the newest env file, then the legacy file", () => {
+  it("selects only the exact slot for the current binding", () => {
+    // At the custom env binding, a newer *other* env file must not be picked
+    // up, and the mainland legacy file must not be picked up either.
     const legacy = writeCred("kimi-code", "a-legacy", "r-legacy", nowSec() + 3600);
-    assert.equal(discoverKimiCodeCredentialPath(), legacy);
-    const older = writeCred("kimi-code-env-aaaaaaaaaaaaaaaa", "a-old", "r-old", nowSec() + 3600);
-    const newer = writeCred("kimi-code-env-bbbbbbbbbbbbbbbb", "a-new", "r-new", nowSec() + 3600);
-    utimesSync(older, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
-    assert.equal(discoverKimiCodeCredentialPath(), newer);
+    const other = writeCred("kimi-code-env-bbbbbbbbbbbbbbbb", "a-new", "r-new", nowSec() + 3600);
+    utimesSync(other, new Date(Date.now() + 60_000), new Date(Date.now() + 60_000));
+    const expected = join(home, "credentials", `${GLOBAL_NAME}.json`);
+    assert.equal(discoverKimiCodeCredentialPath(), expected);
+    assert.equal(readKimiCodeAccessToken(), null);
+    assert.notEqual(discoverKimiCodeCredentialPath(), legacy);
+    assert.notEqual(discoverKimiCodeCredentialPath(), other);
+    // Now the exact slot appears (older than the decoys): it wins.
     const derived = writeCred(GLOBAL_NAME, "a-derived", "r-derived", nowSec() + 3600);
     utimesSync(derived, new Date(Date.now() - 120_000), new Date(Date.now() - 120_000));
     assert.equal(discoverKimiCodeCredentialPath(), derived);
+    assert.equal(readKimiCodeAccessToken(), "a-derived");
     writeFileSync(`${derived}.tmp.1.abcd`, "partial"); // in-flight temp files are ignored
     assert.equal(discoverKimiCodeCredentialPath(), derived);
+  });
+
+  it("accepts the fixed legacy file only at the official mainland binding", () => {
+    // Custom binding: legacy present but must not be used.
+    const legacy = writeCred("kimi-code", "a-legacy", "r-legacy", nowSec() + 3600);
+    assert.equal(readKimiCodeAccessToken(), null);
+    // Mainland binding: the same file is the exact slot and is used.
+    for (const key of ["KIMI_CODE_OAUTH_HOST", "KIMI_CODE_BASE_URL"] as const) {
+      delete process.env[key];
+    }
+    assert.equal(discoverKimiCodeCredentialPath(), legacy);
+    assert.equal(readKimiCodeAccessToken(), "a-legacy");
+    // A global-region env slot does not count at the mainland binding either.
+    writeCred(GLOBAL_NAME, "a-global", "r-global", nowSec() + 3600);
+    assert.equal(discoverKimiCodeCredentialPath(), legacy);
+    assert.equal(readKimiCodeAccessToken(), "a-legacy");
+  });
+
+  it("honors the binding recorded in the credential file", () => {
+    const path = join(home, "credentials", `${GLOBAL_NAME}.json`);
+    mkdirSync(join(home, "credentials"), { recursive: true });
+    // Bound to a different pair: rejected even though the slot name matches.
+    writeFileSync(
+      path,
+      JSON.stringify({
+        access_token: "a-other",
+        refresh_token: "r-other",
+        expires_at: nowSec() + 3600,
+        endpoint: { oauthHost: "https://auth.example.com", baseUrl: "https://api.example.com/v1" },
+      }),
+    );
+    assert.equal(readKimiCodeAccessToken(), null);
+    // Bound to the current pair: accepted.
+    writeFileSync(
+      path,
+      JSON.stringify({
+        access_token: "a-bound",
+        refresh_token: "r-bound",
+        expires_at: nowSec() + 3600,
+        endpoint: { oauthHost: GLOBAL_HOST, baseUrl: GLOBAL_BASE },
+      }),
+    );
+    assert.equal(readKimiCodeAccessToken(), "a-bound");
+    // Spelling variants of the same pair canonicalize to the same binding.
+    writeFileSync(
+      path,
+      JSON.stringify({
+        access_token: "a-canonical",
+        refresh_token: "r-canonical",
+        expires_at: nowSec() + 3600,
+        endpoint: {
+          oauthHost: `${GLOBAL_HOST}:443/`.replace("https://", "HTTPS://"),
+          baseUrl: `${GLOBAL_BASE}/`,
+        },
+      }),
+    );
+    assert.equal(readKimiCodeAccessToken(), "a-canonical");
   });
 
   it("points a fresh login at the derived slot when nothing exists", () => {
@@ -173,6 +237,8 @@ describe("kimi-code credential refresh", () => {
     assert.equal(stored.access_token, "access-1");
     assert.equal(stored.refresh_token, "refresh-1");
     assert.ok(stored.expires_at > nowSec());
+    // The write records the non-secret endpoint binding for future reads.
+    assert.deepEqual(stored.endpoint, { oauthHost: GLOBAL_HOST, baseUrl: GLOBAL_BASE });
     assert.equal(statSync(path).mode & 0o777, 0o600);
     assert.deepEqual(
       readdirSync(join(home, "credentials")).filter((n) => n.includes(".tmp.")),
@@ -213,5 +279,97 @@ describe("kimi-code credential refresh", () => {
         .refresh_token,
       "refresh-cli",
     );
+  });
+
+  it("makes no request and adopts nothing when the credential is bound to a different endpoint", async () => {
+    // A credential whose recorded binding differs from the configured
+    // endpoints must not be refreshed (the refresh token would go to the
+    // ambient host) and must not be adopted as a peer.
+    writeCred(GLOBAL_NAME, "access-0", "refresh-0", nowSec() - 10);
+    const path = join(home, "credentials", `${GLOBAL_NAME}.json`);
+    const stored = JSON.parse(readFileSync(path, "utf8"));
+    stored.endpoint = {
+      oauthHost: "https://auth.example.com",
+      baseUrl: "https://api.example.com/v1",
+    };
+    writeFileSync(path, JSON.stringify(stored));
+
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches++;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    assert.equal(await refreshKimiAuthToken("access-0"), null);
+    assert.equal(fetches, 0, "no HTTP request on a mismatched custom endpoint");
+    assert.equal(readKimiCodeAccessToken(), null);
+  });
+
+  it("posts the refresh token only to the credential-bound OAuth host", async () => {
+    const path = writeCred(GLOBAL_NAME, "access-0", "refresh-0", nowSec() - 10);
+    const stored = JSON.parse(readFileSync(path, "utf8"));
+    stored.endpoint = {
+      oauthHost: "https://auth.example.com",
+      baseUrl: "https://api.example.com/v1",
+    };
+    writeFileSync(path, JSON.stringify(stored));
+    const seen: string[] = [];
+    globalThis.fetch = (async (url: string | URL) => {
+      seen.push(String(url));
+      return new Response(
+        JSON.stringify({
+          access_token: "x",
+          refresh_token: "y",
+          expires_in: 900,
+          scope: "",
+          token_type: "Bearer",
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    // Switch the configured endpoints away from the credential's binding:
+    // the credential is rejected, so nothing is posted anywhere.
+    process.env.KIMI_CODE_OAUTH_HOST = "https://auth.other.example";
+    process.env.KIMI_CODE_BASE_URL = "https://api.other.example";
+    assert.equal(await refreshKimiAuthToken("access-0"), null);
+    assert.deepEqual(seen, []);
+  });
+});
+
+describe("kimi-code /me binding probe", () => {
+  it("treats only HTTP 2xx as valid", async () => {
+    for (const [status, body] of [
+      [200, "{}"],
+      [204, null],
+    ] as const) {
+      globalThis.fetch = (async () => new Response(body, { status })) as typeof fetch;
+      assert.equal(await isKimiCredentialRegionValid("token"), true, `status ${status}`);
+    }
+    for (const status of [401, 403, 404, 500, 503]) {
+      globalThis.fetch = (async () => new Response("{}", { status })) as typeof fetch;
+      assert.equal(await isKimiCredentialRegionValid("token"), false, `status ${status}`);
+    }
+  });
+
+  it("fails closed on network errors and timeouts", async () => {
+    globalThis.fetch = (async () => {
+      throw new Error("network down");
+    }) as typeof fetch;
+    assert.equal(await isKimiCredentialRegionValid("token"), false);
+    globalThis.fetch = (async () =>
+      new Promise<Response>((_resolve, reject) =>
+        setTimeout(() => reject(new Error("timeout")), 10),
+      )) as typeof fetch;
+    assert.equal(await isKimiCredentialRegionValid("token"), false);
+  });
+
+  it("probes the base URL of the current binding", async () => {
+    let url = "";
+    globalThis.fetch = (async (requestUrl: string | URL) => {
+      url = String(requestUrl);
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    assert.equal(await isKimiCredentialRegionValid("token"), true);
+    assert.equal(url, `${GLOBAL_BASE}/me`);
   });
 });

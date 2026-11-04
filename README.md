@@ -72,9 +72,11 @@ main(process.argv.slice(2), {
 
 Pi's built-in `kimi-coding` provider already supports OAuth login via `/login`. This extension handles the credential layer around that login:
 
-- **Syncs refreshed tokens back to `kimi-code`.** Pi stores credentials at `~/.pi/agent/auth.json`; this extension keeps the official CLI's credential file (`~/.kimi-code/credentials/kimi-code.json`) up to date so both stay authenticated.
+- **Syncs refreshed tokens back to `kimi-code`.** Pi stores credentials at `~/.pi/agent/auth.json`; this extension keeps the official CLI's credential file (`~/.kimi-code/credentials/kimi-code.json` for the managed mainland endpoints, or the `kimi-code-env-<hash>` slot that names your custom pair) up to date so both stay authenticated.
 - **Reuses existing `kimi-code` sessions.** If you already use the official CLI, the extension reads its session directly. Set `KIMI_CODE_HOME` if its home directory lives somewhere else.
 - **Supports the legacy `~/.kimi` path.** Read-only. Set `KIMI_SHARE_DIR` to override it.
+- **Binds credentials to their endpoints.** Every credential — pi's `auth.json` entry and the CLI's credential file — records the `{oauthHost, baseUrl}` pair it was minted for, and it is used only while that exact pair is what pi is configured to call. A credential written for one endpoint is never sent to another: the fixed `kimi-code.json` (and the `KIMI_SHARE_DIR` file) count only at the official mainland endpoints, a credential in a custom `kimi-code-env-<hash>` slot counts only for the exact pair its filename encodes, and an old credential without binding metadata counts only at the mainland defaults. Custom endpoint logins still work end to end: `/login` writes the exact slot with its binding, and refreshes post only to the bound OAuth host. `/me` usability checks fail closed — only an explicit 2xx proves a token usable.
+- **`KIMI_API_KEY` is deliberate.** An explicit key is used for the configured API endpoint as-is: it never triggers an OAuth refresh, and a 401 with it surfaces as an auth error rather than falling back to OAuth.
 - **Follows your region.** Managed endpoints follow the selected region (`mainland-cn` default, `global` for kimi.ai accounts) for API, OAuth, and `/login`. See [Region selection](#region-selection).
 - **`KIMI_API_KEY` fallback.** For CI or key-based access:
 

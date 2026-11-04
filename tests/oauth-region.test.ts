@@ -108,18 +108,20 @@ describe("isKimiCredentialRegionValid", () => {
     globalThis.fetch = originalFetch;
   });
 
-  it("treats an explicit 401 as region-invalid and other statuses as usable", async () => {
+  it("treats only explicit 2xx as usable and fails closed otherwise", async () => {
     globalThis.fetch = async () => new Response("unauthorized", { status: 401 });
     assert.equal(await isKimiCredentialRegionValid("tok"), false);
 
     globalThis.fetch = async () => new Response("{}", { status: 200 });
     assert.equal(await isKimiCredentialRegionValid("tok"), true);
 
+    // Non-2xx is not proof of usability: the credential may be bound to a
+    // different deployment, so it must not be reused.
     globalThis.fetch = async () => new Response("server error", { status: 500 });
-    assert.equal(await isKimiCredentialRegionValid("tok"), true);
+    assert.equal(await isKimiCredentialRegionValid("tok"), false);
   });
 
-  it("probes the current region's managed /me endpoint and keeps usability on network failures", async () => {
+  it("probes the current region's managed /me endpoint and fails closed on network failures", async () => {
     let requestedUrl: string | undefined;
     let authHeader: string | null = null;
     globalThis.fetch = async (input, init) => {
@@ -128,7 +130,7 @@ describe("isKimiCredentialRegionValid", () => {
       throw new Error("offline");
     };
 
-    assert.equal(await isKimiCredentialRegionValid("tok-1"), true);
+    assert.equal(await isKimiCredentialRegionValid("tok-1"), false);
     assert.match(requestedUrl ?? "", /\/v1\/me$/);
     assert.equal(authHeader, "Bearer tok-1");
   });

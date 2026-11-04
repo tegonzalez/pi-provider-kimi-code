@@ -82,6 +82,63 @@ export function normalizeKimiBaseV1(baseUrl: string): string {
   return base.endsWith("/v1") ? base : `${base}/v1`;
 }
 
+// =============================================================================
+// Endpoint binding
+//
+// An OAuth credential is minted for exactly one (oauthHost, baseUrl) pair and
+// must never be sent to any other endpoint. The binding is canonicalized so
+// trivial spelling differences (scheme/host case, default ports, trailing
+// slashes) do not fragment slots: scheme and host are lowercased, default
+// ports are dropped (URL parsing does both), and the path is preserved
+// verbatim — including the normalized full `/v1` suffix — because it is part
+// of the API surface the token is sent to.
+// =============================================================================
+
+export interface KimiEndpointBinding {
+  oauthHost: string;
+  baseUrl: string;
+}
+
+export function canonicalizeKimiEndpointUrl(value: string): string {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  try {
+    const parsed = new URL(trimmed);
+    if (!parsed.host) return trimmed;
+    const port = parsed.port ? `:${parsed.port}` : "";
+    const path = parsed.pathname === "/" ? "" : parsed.pathname;
+    return `${parsed.protocol}//${parsed.hostname}${port}${path}${parsed.search}${parsed.hash}`;
+  } catch {
+    return trimmed;
+  }
+}
+
+export const KIMI_MAINLAND_ENDPOINT_BINDING: KimiEndpointBinding = {
+  oauthHost: "https://auth.kimi.com",
+  baseUrl: "https://api.kimi.com/coding/v1",
+};
+
+export function isMainlandKimiEndpointBinding(binding: KimiEndpointBinding): boolean {
+  return (
+    binding.oauthHost === KIMI_MAINLAND_ENDPOINT_BINDING.oauthHost &&
+    binding.baseUrl === KIMI_MAINLAND_ENDPOINT_BINDING.baseUrl
+  );
+}
+
+export function kimiEndpointBindingsEqual(
+  left: KimiEndpointBinding | undefined,
+  right: KimiEndpointBinding | undefined,
+): boolean {
+  return !!left && !!right && left.oauthHost === right.oauthHost && left.baseUrl === right.baseUrl;
+}
+
+/** The binding of the endpoints the process is configured to call right now. */
+export function getKimiEndpointBinding(): KimiEndpointBinding {
+  return {
+    oauthHost: canonicalizeKimiEndpointUrl(getOAuthHost()),
+    baseUrl: canonicalizeKimiEndpointUrl(normalizeKimiBaseV1(getBaseUrl())),
+  };
+}
+
 export const DEFAULT_OAUTH_HOST = KIMI_REGION_PROFILES[ENV_KIMI_CODE_REGION].oauthHost;
 
 export const KIMI_WIRE_PROTOCOLS = ["openai", "anthropic", "responses"] as const;

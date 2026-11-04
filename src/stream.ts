@@ -82,12 +82,13 @@ import {
   type KimiWireProtocol,
   getApiProtocol,
   getBaseUrl,
+  getKimiEndpointBinding,
 } from "./constants.ts";
 import { getKimiProviderHeaders } from "./device.ts";
 import {
   isKimiAuthErrorMessage,
+  readBoundStoredOAuthCredential,
   readKimiCodeAccessToken,
-  readStoredOAuthCredential,
   refreshKimiAuthToken,
 } from "./oauth.ts";
 import {
@@ -226,19 +227,46 @@ const KIMI_API_KEY_ENV_REFERENCES = new Set(["$KIMI_API_KEY", "${KIMI_API_KEY}"]
 // would have read instead of sending an unauthenticated request. Kept last so
 // an explicit key and the environment override keep their existing precedence.
 // Falls back to the kimi-code CLI's live credential (read in place, never
-// copied into auth.json).
+// copied into auth.json) — and only a credential bound to the endpoints pi is
+// configured for is returned.
 function getStoredKimiAccessToken(): string {
-  return readStoredOAuthCredential(PROVIDER_ID)?.access?.trim() || readKimiCodeAccessToken() || "";
+  const binding = getKimiEndpointBinding();
+  return (
+    readBoundStoredOAuthCredential(PROVIDER_ID, binding)?.access?.trim() ||
+    readKimiCodeAccessToken() ||
+    ""
+  );
 }
 
-export function resolveKimiApiKey(apiKey: string | undefined): string {
+export type KimiKeySource = "static" | "oauth";
+
+export interface ResolvedKimiApiKey {
+  key: string;
+  /** "static": an explicit KIMI_API_KEY/configured key, deliberate for the
+   * configured API endpoint — never triggers OAuth refresh or fallback.
+   * "oauth": a bound OAuth token, refreshable on 401. */
+  source: KimiKeySource;
+}
+
+export function resolveKimiApiKeyWithSource(apiKey: string | undefined): ResolvedKimiApiKey {
   if (
     apiKey !== undefined &&
     (KIMI_API_KEY_ENV_REFERENCES.has(apiKey) || apiKey === KIMI_CODE_CREDENTIAL_API_KEY)
   ) {
-    return process.env.KIMI_API_KEY?.trim() || getStoredKimiAccessToken();
+    const envKey = process.env.KIMI_API_KEY?.trim();
+    if (envKey) return { key: envKey, source: "static" };
+    const oauthKey = getStoredKimiAccessToken();
+    return { key: oauthKey, source: "oauth" };
   }
-  return apiKey || process.env.KIMI_API_KEY || getStoredKimiAccessToken();
+  if (apiKey) return { key: apiKey, source: "static" };
+  const envKey = process.env.KIMI_API_KEY?.trim();
+  if (envKey) return { key: envKey, source: "static" };
+  const oauthKey = getStoredKimiAccessToken();
+  return { key: oauthKey, source: "oauth" };
+}
+
+export function resolveKimiApiKey(apiKey: string | undefined): string {
+  return resolveKimiApiKeyWithSource(apiKey).key;
 }
 
 // SimpleStreamOptions.headers is Record<string, string> on pi <=0.79 and
@@ -294,7 +322,9 @@ export function streamSimpleKimi(
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   const filtered = createAssistantMessageEventStream();
-  const initialKey = resolveKimiApiKey(options?.apiKey);
+  const initial = resolveKimiApiKeyWithSource(options?.apiKey);
+  const initialKey = initial.key;
+  const initialSource = initial.source;
 
   const cacheKeyOverride = (
     options as (SimpleStreamOptions & { prompt_cache_key?: unknown }) | undefined
@@ -342,10 +372,16 @@ export function streamSimpleKimi(
   // the model object via modifyModels and rewritten into the request payload
   // here so /v1/chat/completions and /v1/messages see the real wire id.
   const wireModelId = (model as Model<Api> & { wireModelId?: unknown }).wireModelId;
-  const buildPatchedOptions = (apiKey: string): SimpleStreamOptions => {
+  const buildPatchedOptions = (apiKey: string, keySource: KimiKeySource): SimpleStreamOptions => {
     const upload: Uploader | undefined = apiKey
       ? (mimeType, data) =>
-          uploadKimiFile(apiKey, mimeType, data, streamConfig.uploads.thresholdBytes)
+          uploadKimiFile(apiKey, mimeType, data, streamConfig.uploads.thresholdBytes, {
+            // A static key is deliberate for the configured endpoint: a 401
+            // means the key is wrong, not that OAuth should be refreshed or
+            // fallen back to.
+            refreshAccessToken:
+              keySource === "oauth" ? refreshKimiAuthToken : () => Promise.resolve(null),
+          })
       : undefined;
     // Only forward apiKey if we actually have one — never override the
     // caller's credential (e.g. Claude Code OAuth token) with an empty string.
@@ -392,9 +428,10 @@ export function streamSimpleKimi(
   void (async () => {
     let attempt = 0;
     let currentKey = initialKey;
+    let currentSource = initialSource;
 
     while (true) {
-      const patchedOptions = buildPatchedOptions(currentKey);
+      const patchedOptions = buildPatchedOptions(currentKey, currentSource);
       // Route by the module-level protocol flag, not model.api, since we
       // register with a custom api type (kimi-openai-completions /
       // kimi-anthropic-messages / kimi-openai-responses) to avoid overriding
@@ -454,11 +491,14 @@ export function streamSimpleKimi(
             continue;
           }
 
-          // Speculative OAuth refresh on the first auth error. We retry once
-          // so short-lived Kimi tokens invalidated before the local expires
-          // timestamp lapses don't surface as raw 401s to the user.
+          // Speculative OAuth refresh on the first auth error, OAuth-sourced
+          // keys only: a static KIMI_API_KEY is deliberate for the configured
+          // endpoint and must not trigger OAuth refresh or OAuth fallback.
+          // We retry once so short-lived Kimi tokens invalidated before the
+          // local expires timestamp lapses don't surface as raw 401s.
           if (
             attempt === 0 &&
+            currentSource === "oauth" &&
             event.type === "error" &&
             isKimiAuthErrorMessage(event.error?.errorMessage)
           ) {
@@ -497,7 +537,11 @@ export function streamSimpleKimi(
         // started, and flushing the buffered `start` would resurrect the
         // phantom empty assistant message this PR set out to fix.
         console.error("[kimi-coding] stream error:", err);
-        if (attempt === 0 && isKimiAuthErrorMessage(err instanceof Error ? err.message : err)) {
+        if (
+          attempt === 0 &&
+          currentSource === "oauth" &&
+          isKimiAuthErrorMessage(err instanceof Error ? err.message : err)
+        ) {
           const refreshed = await refreshKimiAuthToken(currentKey);
           if (refreshed && refreshed !== currentKey) {
             console.error("[kimi-coding] retrying stream after thrown error with refreshed token");

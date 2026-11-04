@@ -1,8 +1,13 @@
-import { PROVIDER_ID, getBaseUrl, normalizeKimiBaseV1 } from "./constants.ts";
+import {
+  PROVIDER_ID,
+  getBaseUrl,
+  getKimiEndpointBinding,
+  normalizeKimiBaseV1,
+} from "./constants.ts";
 import { getKimiProviderHeaders } from "./device.ts";
 import {
+  readBoundStoredOAuthCredential,
   readKimiCodeAccessToken,
-  readStoredOAuthCredential,
   refreshKimiAuthToken,
 } from "./oauth.ts";
 
@@ -44,7 +49,8 @@ interface BoosterWalletInfo {
 const FIXED_POINT_CENTS = 1_000_000n;
 
 export function getKimiUsageToken(): string | null {
-  const credential = readStoredOAuthCredential(PROVIDER_ID);
+  // Only a credential bound to the configured endpoints is sent to them.
+  const credential = readBoundStoredOAuthCredential(PROVIDER_ID, getKimiEndpointBinding());
   if (credential?.access) return credential.access;
   const apiKey = process.env.KIMI_API_KEY?.trim();
   return apiKey || readKimiCodeAccessToken();
