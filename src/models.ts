@@ -29,6 +29,11 @@ export interface KimiModelMetadata {
 export interface KimiOAuthExtras extends KimiModelMetadata {
   modelCatalog?: Record<string, KimiModelMetadata>;
   modelCatalogVersion?: number;
+  /** Non-secret endpoint binding this credential was minted for. pi core
+   * persists the object a login/refresh returns verbatim into auth.json, so
+   * every credential produced for pi must carry it; absent only on
+   * credentials pi itself hands back from an older unbound store. */
+  endpoint?: { oauthHost: string; baseUrl: string };
 }
 
 export type KimiOAuthCredentials = OAuthCredentials & KimiOAuthExtras;

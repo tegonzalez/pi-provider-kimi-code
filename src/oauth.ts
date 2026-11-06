@@ -712,6 +712,9 @@ async function tryReuseKimiCliCredentials(
       access: data.access_token!,
       refresh: data.refresh_token!,
       expires: expiresAtMs,
+      // pi persists the returned object verbatim into auth.json: record the
+      // binding with it so a later bound read accepts this credential.
+      endpoint: { ...selection.binding },
       ...extras,
     };
   }
@@ -738,6 +741,9 @@ async function tryReuseKimiCliCredentials(
       access: token.access_token,
       refresh: token.refresh_token,
       expires: expiresMs,
+      // pi persists the returned object verbatim into auth.json: record the
+      // binding with it so a later bound read accepts this credential.
+      endpoint: { ...selection.binding },
       ...extras,
     };
   } catch {
@@ -808,17 +814,16 @@ export async function loginKimiCode(callbacks: OAuthLoginCallbacks): Promise<Kim
       const expiresMs = Date.now() + token.expires_in * 1000;
       // A fresh login mints a credential for the endpoints configured right
       // now; record the binding with it in the exact derived slot.
-      writeKimiCodeCredentials(
-        token.access_token,
-        token.refresh_token,
-        expiresMs,
-        selectKimiCodeCredential(),
-      );
+      const selection = selectKimiCodeCredential();
+      writeKimiCodeCredentials(token.access_token, token.refresh_token, expiresMs, selection);
       const extras = await discoverKimiModelMetadata(token.access_token);
       return {
         access: token.access_token,
         refresh: token.refresh_token,
         expires: expiresMs,
+        // pi persists the returned object verbatim into auth.json: record the
+        // binding with it so a later bound read accepts this credential.
+        endpoint: { ...selection.binding },
         ...extras,
       };
     }
@@ -834,6 +839,8 @@ export async function refreshKimiCodeToken(
   // one bound to a different endpoint pair than pi is configured for now; the
   // store — checked against the current binding — is authoritative.
   const binding = getKimiEndpointBinding();
+  // Every return below carries this exact binding: pi persists the object a
+  // refresh returns verbatim into auth.json.
   const piStored = readBoundStoredOAuthCredential(PROVIDER_ID, binding);
   const kimiLocked = await lockKimiCodeCredentials();
   try {
@@ -849,6 +856,7 @@ export async function refreshKimiCodeToken(
           access: kimiCred.access_token,
           refresh: kimiCred.refresh_token,
           expires: kimiExpiresMs,
+          endpoint: { ...binding },
           ...extras,
         };
       }
@@ -878,6 +886,7 @@ export async function refreshKimiCodeToken(
             access: peerAccess,
             refresh: peerRefresh,
             expires: peerExpiresMs,
+            endpoint: { ...binding },
             ...extras,
           };
         }
@@ -890,6 +899,7 @@ export async function refreshKimiCodeToken(
         access: token.access_token,
         refresh: token.refresh_token,
         expires: expiresMs,
+        endpoint: { ...binding },
         ...extras,
       };
     }
@@ -911,6 +921,7 @@ export async function refreshKimiCodeToken(
         access: activeAccessToken,
         refresh: activeRefreshToken,
         expires: initialKimiExpiresMs,
+        endpoint: { ...binding },
         ...extras,
       };
     }
@@ -940,6 +951,7 @@ export async function refreshKimiCodeToken(
           access: peerAccess,
           refresh: peerRefresh,
           expires: peerExpiresMs,
+          endpoint: { ...binding },
           ...extras,
         };
       }
@@ -964,6 +976,7 @@ export async function refreshKimiCodeToken(
       access: accessToken,
       refresh: refreshToken,
       expires: effectiveExpiresMs,
+      endpoint: { ...binding },
       ...extras,
     };
   } finally {
