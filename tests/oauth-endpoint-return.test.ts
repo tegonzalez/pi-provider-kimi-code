@@ -333,6 +333,42 @@ describe("returned credentials carry the current endpoint binding", () => {
     assert.equal(respelled?.access, "live-access");
   });
 
+  it("getKimiApiKey releases only a credential bound to the current pair", async () => {
+    const { getKimiApiKey } = await import("../src/oauth.ts");
+    const cred = (endpoint: unknown) => ({
+      access: "token",
+      refresh: "refresh",
+      expires: Date.now() + 60_000,
+      ...(endpoint ? { endpoint } : {}),
+    });
+
+    // Bound to the current custom pair: released.
+    assert.equal(getKimiApiKey(cred(EXPECTED_BINDING)), "token");
+    // Bound to a different pair: fail closed, no token leaves.
+    assert.throws(
+      () =>
+        getKimiApiKey(
+          cred({
+            oauthHost: "https://auth.other.invalid",
+            baseUrl: "https://api.other.invalid/v1",
+          }),
+        ),
+      /Sign in again/,
+    );
+    // Unbound pre-binding credential at a custom binding: rejected too.
+    assert.throws(() => getKimiApiKey(cred(undefined)), /Sign in again/);
+    // Unbound pre-binding credential at the mainland binding: accepted.
+    for (const key of [
+      "KIMI_CODE_OAUTH_HOST",
+      "KIMI_CODE_BASE_URL",
+      "KIMI_OAUTH_HOST",
+      "KIMI_BASE_URL",
+    ] as const) {
+      delete process.env[key];
+    }
+    assert.equal(getKimiApiKey(cred(undefined)), "token");
+  });
+
   it("a credential returned for a custom pair is not accepted after switching to the mainland binding", async () => {
     writeCliCredential("custom-access", "custom-refresh", nowSec() + 3600);
     mockFetch((url) => {

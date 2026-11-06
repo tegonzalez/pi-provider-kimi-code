@@ -996,7 +996,29 @@ export async function refreshKimiCodeToken(
 // =============================================================================
 
 export function getKimiApiKey(credentials: OAuthCredentials): string {
-  return credentials.access;
+  // pi hands this whatever credential its own storage holds, which may have
+  // been minted for endpoints the process is no longer configured for. A
+  // token bound to a different endpoint pair must never leave for the
+  // configured endpoints (AC-1.5): fail closed into a re-login error instead
+  // of an unauthenticated request. Unbound pre-binding credentials count
+  // only at the official mainland default binding.
+  const endpoint = (credentials as Partial<StoredOAuthCredential>).endpoint;
+  if (endpoint === undefined) {
+    if (isMainlandKimiEndpointBinding(getKimiEndpointBinding())) return credentials.access;
+  } else if (
+    typeof endpoint.oauthHost === "string" &&
+    typeof endpoint.baseUrl === "string" &&
+    kimiEndpointBindingsEqual(
+      {
+        oauthHost: canonicalizeKimiEndpointUrl(endpoint.oauthHost),
+        baseUrl: canonicalizeKimiEndpointUrl(endpoint.baseUrl),
+      },
+      getKimiEndpointBinding(),
+    )
+  ) {
+    return credentials.access;
+  }
+  throw new KimiLoginRequiredError();
 }
 
 export function isKimiAuthErrorMessage(message: unknown): boolean {
