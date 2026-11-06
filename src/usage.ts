@@ -48,12 +48,33 @@ interface BoosterWalletInfo {
 
 const FIXED_POINT_CENTS = 1_000_000n;
 
-export function getKimiUsageToken(): string | null {
+export type KimiUsageTokenSource = "static" | "oauth";
+
+export interface ResolvedKimiUsageToken {
+  key: string;
+  /** "static": KIMI_API_KEY, deliberate for the configured API endpoint —
+   * never triggers OAuth refresh or OAuth fallback. "oauth": a credential
+   * bound to the configured endpoints (pi's stored credential, else the
+   * kimi-code CLI credential), refreshable on 401. */
+  source: KimiUsageTokenSource;
+}
+
+export function resolveKimiUsageTokenWithSource(): ResolvedKimiUsageToken | null {
+  // Mirror the stream/upload precedence: an explicit static KIMI_API_KEY wins
+  // over stored OAuth credentials, and a static key's 401 surfaces as an auth
+  // error instead of refreshing or falling back to OAuth.
+  const envKey = process.env.KIMI_API_KEY?.trim();
+  if (envKey) return { key: envKey, source: "static" };
   // Only a credential bound to the configured endpoints is sent to them.
-  const credential = readBoundStoredOAuthCredential(PROVIDER_ID, getKimiEndpointBinding());
-  if (credential?.access) return credential.access;
-  const apiKey = process.env.KIMI_API_KEY?.trim();
-  return apiKey || readKimiCodeAccessToken();
+  const binding = getKimiEndpointBinding();
+  const oauth =
+    readBoundStoredOAuthCredential(PROVIDER_ID, binding)?.access?.trim() ||
+    readKimiCodeAccessToken();
+  return oauth ? { key: oauth, source: "oauth" } : null;
+}
+
+export function getKimiUsageToken(): string | null {
+  return resolveKimiUsageTokenWithSource()?.key ?? null;
 }
 
 function toNumber(value: unknown): number | null {
@@ -437,6 +458,9 @@ function fetchKimiUsage(token: string, signal: AbortSignal): Promise<Response> {
 interface KimiSnapshotOptions {
   timeoutMs?: number;
   token?: string;
+  /** What the explicit `token` is: "static" (default) never refreshes or
+   * falls back to OAuth on 401; "oauth" retains the refresh behavior. */
+  tokenSource?: KimiUsageTokenSource;
   refreshOnUnauthorized?: boolean;
 }
 
@@ -450,7 +474,11 @@ async function fetchKimiSnapshot(
   endpoint: KimiSnapshotEndpoint,
   options: KimiSnapshotOptions = {},
 ): Promise<KimiUsageSnapshot> {
-  const token = options.token ?? getKimiUsageToken();
+  const resolved =
+    options.token !== undefined
+      ? { key: options.token, source: options.tokenSource ?? ("static" as const) }
+      : resolveKimiUsageTokenWithSource();
+  const token = resolved?.key;
   if (!token) {
     return { summary: `${endpoint.prefix}: missing credentials. Run /login kimi-coding.` };
   }
@@ -459,7 +487,14 @@ async function fetchKimiSnapshot(
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 15_000);
   try {
     let response = await endpoint.request(token, controller.signal);
-    if (response.status === 401 && options.refreshOnUnauthorized !== false) {
+    // A static key is deliberate for the configured endpoint: a 401 means the
+    // key is wrong, not that OAuth should be refreshed or fallen back to.
+    // Only a bound OAuth token retains the refresh path (AC-1.7).
+    if (
+      response.status === 401 &&
+      resolved.source === "oauth" &&
+      options.refreshOnUnauthorized !== false
+    ) {
       const refreshed = await refreshKimiAuthToken(token, { signal: controller.signal });
       if (refreshed) response = await endpoint.request(refreshed, controller.signal);
     }

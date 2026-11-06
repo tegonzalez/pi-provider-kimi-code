@@ -89,6 +89,8 @@ import {
   fetchKimiUsageSnapshot,
   fetchKimiUserInfoSnapshot,
   getKimiUsageToken,
+  resolveKimiUsageTokenWithSource,
+  type ResolvedKimiUsageToken,
 } from "./src/usage.ts";
 import { buildMoonshotFetchTool, buildMoonshotSearchTool } from "./src/tools/moonshot.ts";
 import { buildKimiDatasourceTool } from "./src/tools/datasource.ts";
@@ -176,11 +178,16 @@ function applyEffectiveKimiRuntimeConfig(
 
 async function refreshModelExtras(
   state: KimiRuntimeState,
-  token = getKimiUsageToken(),
+  resolved: ResolvedKimiUsageToken | null = resolveKimiUsageTokenWithSource(),
 ): Promise<boolean> {
-  if (!token) return false;
-  const extras = await discoverKimiModelMetadata(token, state.config.protocol, {
-    refreshAccessToken: refreshKimiAuthToken,
+  const key = resolved?.key;
+  if (!key) return false;
+  const extras = await discoverKimiModelMetadata(key, state.config.protocol, {
+    // A static key is deliberate for the configured endpoint: a 401 is an
+    // auth error, not a cue to refresh or fall back to OAuth. Only a bound
+    // OAuth token retains the recovery path.
+    refreshAccessToken:
+      resolved.source === "oauth" ? refreshKimiAuthToken : () => Promise.resolve(null),
   });
   if (Object.keys(extras).length === 0) return false;
   Object.assign(state.modelExtras, extras);
@@ -191,11 +198,11 @@ async function refreshModelExtras(
 // started with may already be dead by the time the request goes out. Retry
 // once, but only when the stored token actually changed underneath us.
 async function discoverModelExtras(state: KimiRuntimeState): Promise<boolean> {
-  const token = getKimiUsageToken();
-  if (await refreshModelExtras(state, token)) return true;
-  const refreshedToken = getKimiUsageToken();
-  if (!refreshedToken || refreshedToken === token) return false;
-  return refreshModelExtras(state, refreshedToken);
+  const resolved = resolveKimiUsageTokenWithSource();
+  if (await refreshModelExtras(state, resolved)) return true;
+  const next = resolveKimiUsageTokenWithSource();
+  if (!next || next.key === resolved?.key) return false;
+  return refreshModelExtras(state, next);
 }
 
 async function openSettingsMenu(

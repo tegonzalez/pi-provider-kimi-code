@@ -11,9 +11,11 @@ import {
   formatKimiUserInfo,
   formatResetTime,
   formatUsageRow,
+  getKimiUsageToken,
   parseKimiUserInfo,
   parseUsageRow,
   parseUsageSummary,
+  resolveKimiUsageTokenWithSource,
 } from "../src/usage.ts";
 
 const SHANGHAI = "Asia/Shanghai";
@@ -500,5 +502,258 @@ describe("formatUsageRow", () => {
       formatResetTime(1_779_163_968, { now: NOW, timeZone: SHANGHAI }),
       "May 19 at 12:12pm (Asia/Shanghai)",
     );
+  });
+});
+
+describe("usage token source tagging", () => {
+  const MAINLAND_BINDING = {
+    oauthHost: "https://auth.kimi.com",
+    baseUrl: "https://api.kimi.com/coding/v1",
+  };
+
+  function snapshotEnv(): Record<string, string | undefined> {
+    const keys = [
+      "PI_CODING_AGENT_DIR",
+      "KIMI_CODE_HOME",
+      "KIMI_SHARE_DIR",
+      "KIMI_API_KEY",
+      "KIMI_CODE_OAUTH_HOST",
+      "KIMI_OAUTH_HOST",
+      "KIMI_CODE_BASE_URL",
+      "KIMI_BASE_URL",
+    ] as const;
+    return Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  }
+
+  function restoreEnv(saved: Record<string, string | undefined>): void {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+
+  function isolateCredentials(t: { name: string }): string {
+    const agentDir = mkdtempSync(join(tmpdir(), `pi-kimi-usage-src-${t.name}-`));
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.KIMI_CODE_HOME = join(agentDir, "no-kimi-code");
+    process.env.KIMI_SHARE_DIR = join(agentDir, "no-kimi-share");
+    for (const key of [
+      "KIMI_API_KEY",
+      "KIMI_CODE_OAUTH_HOST",
+      "KIMI_OAUTH_HOST",
+      "KIMI_CODE_BASE_URL",
+      "KIMI_BASE_URL",
+    ] as const) {
+      delete process.env[key];
+    }
+    return agentDir;
+  }
+
+  function writeBoundOAuthCredential(agentDir: string, access: string): void {
+    writeBoundOAuthCredentialFor(agentDir, access, Date.now() + 60_000);
+  }
+
+  function writeBoundOAuthCredentialFor(agentDir: string, access: string, expiresMs: number): void {
+    writeFileSync(
+      join(agentDir, "auth.json"),
+      JSON.stringify({
+        "kimi-coding": {
+          type: "oauth",
+          access,
+          refresh: "refresh-token",
+          expires: expiresMs,
+          endpoint: MAINLAND_BINDING,
+        },
+      }),
+      "utf8",
+    );
+  }
+
+  it("resolves KIMI_API_KEY as static even when a bound OAuth credential exists", async () => {
+    const saved = snapshotEnv();
+    const originalFetch = globalThis.fetch;
+    const agentDir = isolateCredentials({ name: "resolve" });
+    writeBoundOAuthCredential(agentDir, "oauth-access");
+    process.env.KIMI_API_KEY = "static-key";
+    try {
+      const resolved = resolveKimiUsageTokenWithSource();
+      assert.deepEqual(resolved, { key: "static-key", source: "static" });
+      assert.equal(getKimiUsageToken(), "static-key");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv(saved);
+      rmSync(agentDir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves a bound OAuth credential as oauth", async () => {
+    const saved = snapshotEnv();
+    const originalFetch = globalThis.fetch;
+    const agentDir = isolateCredentials({ name: "resolve-oauth" });
+    writeBoundOAuthCredential(agentDir, "oauth-access");
+    try {
+      const resolved = resolveKimiUsageTokenWithSource();
+      assert.deepEqual(resolved, { key: "oauth-access", source: "oauth" });
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv(saved);
+      rmSync(agentDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a static key's 401 never refreshes or falls back to OAuth", async () => {
+    const saved = snapshotEnv();
+    const originalFetch = globalThis.fetch;
+    const agentDir = isolateCredentials({ name: "static-401" });
+    writeBoundOAuthCredential(agentDir, "oauth-access");
+    process.env.KIMI_API_KEY = "static-key";
+    const urls: string[] = [];
+    globalThis.fetch = (async (input: unknown) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.endsWith("/usages")) return new Response("unauthorized", { status: 401 });
+      throw new Error(`unexpected request: ${url}`);
+    }) as typeof fetch;
+    try {
+      const snapshot = await fetchKimiUsageSnapshot({ timeoutMs: 5_000 });
+      assert.equal(snapshot.summary, "Usage: fetch failed (401)");
+      // Exactly one request: no token refresh, no OAuth retry.
+      assert.deepEqual(urls, [urls[0]]);
+      assert.ok(urls[0].endsWith("/usages"));
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv(saved);
+      rmSync(agentDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a bound OAuth token's 401 refreshes and retries once", async () => {
+    const saved = snapshotEnv();
+    const originalFetch = globalThis.fetch;
+    const agentDir = isolateCredentials({ name: "oauth-401" });
+    writeBoundOAuthCredential(agentDir, "stale-oauth");
+    const urls: string[] = [];
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.endsWith("/usages")) {
+        const authorization = init?.headers as Record<string, string> | undefined;
+        const token = authorization?.Authorization;
+        return token === "Bearer rotated-oauth"
+          ? new Response(JSON.stringify({ usage: { limit: 10, used: 1 } }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            })
+          : new Response("unauthorized", { status: 401 });
+      }
+      if (url.endsWith("/api/oauth/token")) {
+        return new Response(
+          JSON.stringify({
+            access_token: "rotated-oauth",
+            refresh_token: "rotated-refresh",
+            expires_in: 900,
+            scope: "kimi-code",
+            token_type: "Bearer",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }) as typeof fetch;
+    try {
+      const snapshot = await fetchKimiUsageSnapshot({ timeoutMs: 5_000 });
+      assert.match(snapshot.summary, /10% used/);
+      assert.ok(urls.some((u) => u.endsWith("/api/oauth/token")));
+      assert.equal(urls.filter((u) => u.endsWith("/usages")).length, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv(saved);
+      rmSync(agentDir, { recursive: true, force: true });
+    }
+  });
+
+  it("an explicit token is static by default and refreshes only when tagged oauth", async () => {
+    const saved = snapshotEnv();
+    const originalFetch = globalThis.fetch;
+    const agentDir = isolateCredentials({ name: "explicit-token" });
+    const urls: string[] = [];
+    globalThis.fetch = (async (input: unknown) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.endsWith("/usages")) return new Response("unauthorized", { status: 401 });
+      if (url.endsWith("/api/oauth/token")) {
+        return new Response(
+          JSON.stringify({
+            access_token: "rotated-oauth",
+            refresh_token: "rotated-refresh",
+            expires_in: 900,
+            scope: "kimi-code",
+            token_type: "Bearer",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }) as typeof fetch;
+    try {
+      urls.length = 0;
+      const staticSnapshot = await fetchKimiUsageSnapshot({
+        token: "explicit-key",
+        timeoutMs: 5_000,
+      });
+      assert.equal(staticSnapshot.summary, "Usage: fetch failed (401)");
+      assert.ok(!urls.some((u) => u.endsWith("/api/oauth/token")));
+
+      urls.length = 0;
+      const oauthSnapshot = await fetchKimiUsageSnapshot({
+        token: "explicit-key",
+        tokenSource: "oauth",
+        timeoutMs: 5_000,
+      });
+      assert.equal(oauthSnapshot.summary, "Usage: fetch failed (401)");
+      // No stored credential exists for the explicit key, so the refresh path
+      // finds nothing to post — still no token endpoint call.
+      assert.ok(!urls.some((u) => u.endsWith("/api/oauth/token")));
+
+      // A tagged-oauth token with a bound stored credential retains the
+      // refresh behavior: the stale token is posted to the OAuth host.
+      writeBoundOAuthCredentialFor(agentDir, "stored-oauth", Date.now() - 10_000);
+      urls.length = 0;
+      const storedSnapshot = await fetchKimiUsageSnapshot({
+        token: "stored-oauth",
+        tokenSource: "oauth",
+        timeoutMs: 5_000,
+      });
+      assert.equal(storedSnapshot.summary, "Usage: fetch failed (401)");
+      assert.ok(urls.some((u) => u.endsWith("/api/oauth/token")));
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv(saved);
+      rmSync(agentDir, { recursive: true, force: true });
+    }
+  });
+
+  it("datasource-style refreshOnUnauthorized: false still disables the OAuth retry", async () => {
+    const saved = snapshotEnv();
+    const originalFetch = globalThis.fetch;
+    const agentDir = isolateCredentials({ name: "no-refresh" });
+    writeBoundOAuthCredential(agentDir, "stale-oauth");
+    const urls: string[] = [];
+    globalThis.fetch = (async (input: unknown) => {
+      urls.push(String(input));
+      return new Response("unauthorized", { status: 401 });
+    }) as typeof fetch;
+    try {
+      const snapshot = await fetchKimiUsageSnapshot({
+        refreshOnUnauthorized: false,
+        timeoutMs: 5_000,
+      });
+      assert.equal(snapshot.summary, "Usage: fetch failed (401)");
+      assert.ok(!urls.some((u) => u.endsWith("/api/oauth/token")));
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv(saved);
+      rmSync(agentDir, { recursive: true, force: true });
+    }
   });
 });
